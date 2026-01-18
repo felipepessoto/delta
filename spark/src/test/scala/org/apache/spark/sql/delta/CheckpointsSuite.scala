@@ -29,7 +29,7 @@ import org.apache.spark.sql.delta.actions._
 import org.apache.spark.sql.delta.coordinatedcommits.CatalogOwnedTestBaseSuite
 import org.apache.spark.sql.delta.deletionvectors.DeletionVectorsSuite
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
-import org.apache.spark.sql.delta.storage.LocalLogStore
+import io.delta.storage.LocalLogStore
 import org.apache.spark.sql.delta.test.{DeltaSQLCommandTest, DeltaSQLTestUtils}
 import org.apache.spark.sql.delta.test.DeltaTestImplicits._
 import org.apache.spark.sql.delta.util.DeltaCommitFileProvider
@@ -1022,19 +1022,19 @@ class CheckpointsSuite
   }
 }
 
-class OverwriteTrackingLogStore(sparkConf: SparkConf, hadoopConf: Configuration)
-  extends LocalLogStore(sparkConf, hadoopConf) {
+class OverwriteTrackingLogStore(hadoopConf: Configuration)
+  extends LocalLogStore(hadoopConf) {
 
   var fileToOverwriteCount: Map[Path, Long] = Map[Path, Long]()
 
   private var isPartialWriteVisibleBool: Boolean = false
-  override def isPartialWriteVisible(path: Path, hadoopConf: Configuration): Boolean =
+  override def isPartialWriteVisible(path: Path, hadoopConf: Configuration): java.lang.Boolean =
     isPartialWriteVisibleBool
 
   override def write(
       path: Path,
-      actions: Iterator[String],
-      overwrite: Boolean,
+      actions: java.util.Iterator[String],
+      overwrite: java.lang.Boolean,
       hadoopConf: Configuration): Unit = {
     val toAdd = if (overwrite) 1 else 0
     fileToOverwriteCount += path -> (fileToOverwriteCount.getOrElse(path, 0L) + toAdd)

@@ -20,7 +20,7 @@ import com.databricks.spark.util.Log4jUsageLogger
 import org.apache.spark.sql.delta.CheckpointInstance.Format
 import org.apache.spark.sql.delta.DeltaTestUtils.BOOLEAN_DOMAIN
 import org.apache.spark.sql.delta.coordinatedcommits.CoordinatedCommitsBaseSuite
-import org.apache.spark.sql.delta.storage.LocalLogStore
+import io.delta.storage.LocalLogStore
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import org.apache.spark.sql.delta.util.{FileNames, JsonUtils}
 import org.apache.hadoop.conf.Configuration
@@ -348,8 +348,9 @@ class FindLastCompleteCheckpointSuite
  * `DeltaLog.findLastCompleteCheckpointBefore` method.
  */
 class CustomListingLogStore(
-  sparkConf: SparkConf,
-  hadoopConf: Configuration) extends LocalLogStore(sparkConf, hadoopConf) {
+  hadoopConf: Configuration) extends LocalLogStore(hadoopConf) {
+
+  import scala.collection.JavaConverters._
 
   var listFromCount = 0
   var elementsConsumedFromListFromIter = 0
@@ -357,7 +358,7 @@ class CustomListingLogStore(
   // the default listing result from the actual filesystem will be returned.
   var customListingResult: Option[Seq[FileStatus]] = None
 
-  override def listFrom(path: Path, hadoopConf: Configuration): Iterator[FileStatus] = {
+  override def listFrom(path: Path, hadoopConf: Configuration): java.util.Iterator[FileStatus] = {
     customListingResult.map { results =>
       listFromCount += 1
       results
@@ -368,6 +369,7 @@ class CustomListingLogStore(
           elementsConsumedFromListFromIter += 1
           file
         }
+        .asJava
     }.getOrElse(super.listFrom(path, hadoopConf))
   }
 
