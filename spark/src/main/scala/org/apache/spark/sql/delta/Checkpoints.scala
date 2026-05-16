@@ -31,7 +31,7 @@ import org.apache.spark.sql.delta.logging.DeltaLogKeys
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.storage.LogStore
-import org.apache.spark.sql.delta.util.{DeltaFileOperations, DeltaLogGroupingIterator, FileNames, TableParquetCompressionCodecOption}
+import org.apache.spark.sql.delta.util.{DeltaFileOperations, DeltaLogGroupingIterator, FileNames, TableParquetCompressionCodecOption, TableParquetVersionOption}
 import org.apache.spark.sql.delta.util.{Utils => DeltaUtils}
 import org.apache.spark.sql.delta.util.FileNames._
 import org.apache.spark.sql.delta.util.JsonUtils
@@ -768,6 +768,10 @@ object Checkpoints
       val writeOptions = VariantShreddingShims.getVariantInferShreddingSchemaOptions(false) ++
         TableParquetCompressionCodecOption.getWriterOptions(
           writerOptions = Map.empty,
+          tableProperties = snapshot.metadata.configuration) ++
+        TableParquetVersionOption.getWriterOptions(
+          spark = spark,
+          writerOptions = Map.empty,
           tableProperties = snapshot.metadata.configuration)
       (format.prepareWrite(spark, job, Map.empty ++ writeOptions, schema),
         new SerializableConfiguration(job.getConfiguration))
@@ -1046,8 +1050,9 @@ object Checkpoints
    *
    * @param tableProperties The configuration map from the table's [[Metadata]]. This is used to
    *                        honor table properties that affect checkpoint Parquet files such as
-   *                        `delta.parquet.compression.codec`. Pass [[Map.empty]] if the table
-   *                        properties are not known (e.g., from synthetic test setups).
+   *                        `delta.parquet.compression.codec` and `delta.parquet.format.version`.
+   *                        Pass [[Map.empty]] if the table properties are not known (e.g., from
+   *                        synthetic test setups).
    */
   def createCheckpointV2ParquetFile(
       spark: SparkSession,
@@ -1065,7 +1070,11 @@ object Checkpoints
     val job = Job.getInstance(hadoopConf)
     val writeOptions = TableParquetCompressionCodecOption.getWriterOptions(
       writerOptions = Map.empty,
-      tableProperties = tableProperties)
+      tableProperties = tableProperties) ++
+      TableParquetVersionOption.getWriterOptions(
+        spark = spark,
+        writerOptions = Map.empty,
+        tableProperties = tableProperties)
     val factory = format.prepareWrite(spark, job, writeOptions, schema)
     val serConf = new SerializableConfiguration(job.getConfiguration)
     val finalSparkPath = SparkPath.fromPath(finalPath)

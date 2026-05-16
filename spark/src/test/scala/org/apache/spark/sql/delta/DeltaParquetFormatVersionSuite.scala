@@ -250,4 +250,102 @@ class DeltaParquetFormatVersionSuite
       validateFileParquetVersion("t1", v1Format)
     }
   }
+
+  /** Recursively lists all parquet files in the given _delta_log directory (incl. _sidecars/). */
+  private def listAllCheckpointParquetFiles(logPath: Path): Seq[Path] = {
+    val fs = logPath.getFileSystem(spark.sessionState.newHadoopConf())
+    if (!fs.exists(logPath)) return Seq.empty
+    val result = scala.collection.mutable.ArrayBuffer.empty[Path]
+    val it = fs.listFiles(logPath, /* recursive = */ true)
+    while (it.hasNext) {
+      val st = it.next()
+      val name = st.getPath.getName
+      if (name.endsWith(".parquet") && name.contains(".checkpoint.")) {
+        result += st.getPath
+      }
+    }
+    result.toSeq
+  }
+
+  /** Reads the encodings used in any column-chunk of any row-group of the given Parquet file. */
+  private def readParquetFileEncodings(path: Path): Set[Encoding] = {
+    val file = HadoopInputFile.fromPath(path, new Configuration())
+    val reader = ParquetFileReader.open(file)
+    try {
+      reader.getFooter.getBlocks.asScala.flatMap { block =>
+        block.getColumns.asScala.flatMap(_.getEncodings.asScala.toSet)
+      }.toSet
+    } finally {
+      reader.close()
+    }
+  }
+
+  private def assertCheckpointFileParquetVersion(
+      path: Path, formatVersion: ParquetFormatVersion): Unit = {
+    val encodings = readParquetFileEncodings(path)
+    formatVersion match {
+      case ParquetFormatVersion.V1_0_0 =>
+        assert(!encodings.contains(Encoding.DELTA_BINARY_PACKED),
+          s"Expected no DELTA_BINARY_PACKED encoding in checkpoint $path but got: $encodings")
+      case ParquetFormatVersion.V2_12_0 =>
+        assert(encodings.contains(Encoding.DELTA_BINARY_PACKED),
+          s"Expected DELTA_BINARY_PACKED encoding in checkpoint $path but got: $encodings")
+      case _ =>
+        fail(s"Unexpected format version: $formatVersion")
+    }
+  }
+
+  test("V2 checkpoint files honor the Parquet format version") {
+    assumeSpark56414Available()
+    withSQLConf(
+      DeltaConfigs.CHECKPOINT_POLICY.defaultTablePropertyKey -> CheckpointPolicy.V2.name,
+      DeltaSQLConf.CHECKPOINT_V2_TOP_LEVEL_FILE_FORMAT.key -> V2Checkpoint.Format.PARQUET.name) {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        sql(s"""CREATE TABLE delta.`$path` (c0 BIGINT) USING delta
+               |TBLPROPERTIES ('$tablePropertyKey' = '${v2Format.getVersion()}')""".stripMargin)
+        // Generate some commits so the snapshot has content to checkpoint.
+        (1 to 5).foreach { i =>
+          spark.range(i, i + 1).toDF("c0").write.format("delta").mode("append").save(path)
+        }
+        val log = DeltaLog.forTable(spark, path)
+        log.checkpoint(log.update())
+        val checkpointFiles = listAllCheckpointParquetFiles(log.logPath)
+        assert(checkpointFiles.nonEmpty, "Expected at least one V2 checkpoint parquet file")
+        checkpointFiles.foreach { p => assertCheckpointFileParquetVersion(p, v2Format) }
+      }
+    }
+  }
+
+  test("Classic checkpoint files honor the Parquet format version") {
+    assumeSpark56414Available()
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      sql(s"""CREATE TABLE delta.`$path` (c0 BIGINT) USING delta
+             |TBLPROPERTIES ('$tablePropertyKey' = '${v2Format.getVersion()}')""".stripMargin)
+      (1 to 5).foreach { i =>
+        spark.range(i, i + 1).toDF("c0").write.format("delta").mode("append").save(path)
+      }
+      val log = DeltaLog.forTable(spark, path)
+      log.checkpoint(log.update())
+      val checkpointFiles = listAllCheckpointParquetFiles(log.logPath)
+      assert(checkpointFiles.nonEmpty, "Expected at least one classic checkpoint parquet file")
+      checkpointFiles.foreach { p => assertCheckpointFileParquetVersion(p, v2Format) }
+    }
+  }
+
+  test("V1 is the default for checkpoint files when the table property is unset") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      sql(s"""CREATE TABLE delta.`$path` (c0 BIGINT) USING delta""".stripMargin)
+      (1 to 5).foreach { i =>
+        spark.range(i, i + 1).toDF("c0").write.format("delta").mode("append").save(path)
+      }
+      val log = DeltaLog.forTable(spark, path)
+      log.checkpoint(log.update())
+      val checkpointFiles = listAllCheckpointParquetFiles(log.logPath)
+      assert(checkpointFiles.nonEmpty, "Expected at least one checkpoint parquet file")
+      checkpointFiles.foreach { p => assertCheckpointFileParquetVersion(p, v1Format) }
+    }
+  }
 }
