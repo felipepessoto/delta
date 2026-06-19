@@ -323,6 +323,50 @@ class DeltaRetentionSuite extends QueryTest
     }
   }
 
+  test("log compaction files are cleaned up based on their start version") {
+    withTempDir { tempDir =>
+      val clock = new ManualClock(getStartTimeForRetentionTest)
+      val log = DeltaLog.forTable(spark, new Path(tempDir.getCanonicalPath), clock)
+      val logPath = new File(log.logPath.toUri)
+
+      def compactedRanges(): Set[(Long, Long)] = {
+        logPath.listFiles()
+          .map(f => new Path(f.getCanonicalPath))
+          .filter(FileNames.isCompactedDeltaFile)
+          .map(FileNames.compactedDeltaVersions)
+          .toSet
+      }
+
+      // Commit versions 0..4 and create a checkpoint at version 4 (the cutoff checkpoint).
+      startTxnWithManualLogCleanup(log).commit(createTestAddFile(encodedPath = "0") :: Nil, testOp)
+      (1 to 4).foreach { i =>
+        log.startTransaction().commit(createTestAddFile(encodedPath = i.toString) :: Nil, testOp)
+      }
+      // A compaction starting before the cutoff checkpoint must be deleted.
+      LogCompaction.compact(log, log.update(), startVersion = 1, endVersion = 3)
+      log.checkpoint()
+
+      // Commit versions 5..6 (after the checkpoint) and compact them. This compaction starts after
+      // the cutoff checkpoint, so it must be retained.
+      (5 to 6).foreach { i =>
+        log.startTransaction().commit(createTestAddFile(encodedPath = i.toString) :: Nil, testOp)
+      }
+      LogCompaction.compact(log, log.update(), startVersion = 5, endVersion = 6)
+
+      assert(compactedRanges() === Set((1L, 3L), (5L, 6L)))
+
+      clock.advance(intervalStringToMillis(DeltaConfigs.LOG_RETENTION.defaultValue) +
+        intervalStringToMillis("interval 1 day"))
+      log.cleanUpExpiredLogs(log.update())
+
+      // The [1, 3] compaction (start version <= the cutoff checkpoint version 4) is deleted, while
+      // the [5, 6] compaction (start version after the checkpoint) is retained.
+      assert(compactedRanges() === Set((5L, 6L)))
+      // Sanity check: the pre-checkpoint commit files were also cleaned up.
+      assert(!getFileVersions(getDeltaFiles(logPath)).contains(1L))
+    }
+  }
+
   test("allow users to expire transaction identifiers from checkpoints") {
     withTempDir { dir =>
       val clock = new ManualClock(getStartTimeForRetentionTest)

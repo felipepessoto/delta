@@ -171,10 +171,26 @@ trait MetadataCleanup extends DeltaLogging {
     if (latestCheckpoint.isEmpty) return Iterator.empty
     val threshold = latestCheckpoint.get.version - 1L
     val files = store.listFrom(listingPrefix(logPath, 0), newDeltaHadoopConf())
-      .filter(f => isCheckpointFile(f) || isDeltaFile(f) || isChecksumFile(f))
+      .filter(f =>
+        isCheckpointFile(f) || isDeltaFile(f) || isChecksumFile(f) || isCompactedDeltaFile(f))
 
     new BufferingLogDeletionIterator(
-      files, fileCutOffTime, threshold, getDeltaFileChecksumOrCheckpointVersion)
+      files, fileCutOffTime, threshold, getFileVersionForCleanup)
+  }
+
+  /**
+   * Helper function for getting the version of a file for cleanup purposes.
+   * Supports checkpoint, delta, checksum, and compacted delta files.
+   */
+  private def getFileVersionForCleanup(filePath: Path): Long = {
+    if (isCompactedDeltaFile(filePath)) {
+      // For compacted delta files, use the start version for cleanup ordering.
+      // A compacted delta x.y.compacted.json should be deleted when all commits
+      // up to its start version are expired.
+      compactedDeltaVersions(filePath)._1
+    } else {
+      getDeltaFileChecksumOrCheckpointVersion(filePath)
+    }
   }
 
   protected def checkpointExistsAtCleanupBoundary(deltaLog: DeltaLog, version: Long): Boolean = {

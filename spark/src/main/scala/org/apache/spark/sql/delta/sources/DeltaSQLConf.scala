@@ -2936,6 +2936,34 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(true)
 
+  val DELTALOG_LOG_COMPACTION_ENABLED =
+    buildConf("deltaLog.logCompaction.enabled")
+      .doc(
+        "If true, a post-commit hook will periodically create log compaction files " +
+        "(`<x>.<y>.compacted.json`) that aggregate the actions of a range of commits. " +
+        "Readers that support compacted deltas (see `deltaLog.minorCompaction.useForReads`) " +
+        "can use them to speed up snapshot construction without the cost of a full " +
+        "checkpoint. This is most effective when the checkpoint interval is a multiple of " +
+        "and larger than `deltaLog.logCompaction.interval`. Compaction files are optional " +
+        "and do not require any protocol or table feature upgrade.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
+  val DELTALOG_LOG_COMPACTION_INTERVAL =
+    buildConf("deltaLog.logCompaction.interval")
+      .doc(
+        "The commit interval at which the log compaction post-commit hook produces a log " +
+        "compaction file, when `deltaLog.logCompaction.enabled` is set. A compaction is " +
+        "attempted after a commit whose version is a multiple of this interval, covering the " +
+        "most recent commits in that window (bounded below by the latest checkpoint). To get " +
+        "non-overlapping, reader-usable compaction files, set the checkpoint interval to a " +
+        "multiple of this value.")
+      .internal()
+      .intConf
+      .checkValue(_ >= 2, "deltaLog.logCompaction.interval must be at least 2.")
+      .createWithDefault(10)
+
   val ICEBERG_MAX_COMMITS_TO_CONVERT = buildConf("iceberg.maxPendingCommits")
     .doc("""
         |The maximum number of pending Delta commits to convert to Iceberg incrementally.
