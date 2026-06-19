@@ -122,6 +122,12 @@ trait MetadataCleanup extends DeltaLogging {
           }
         }
       }
+      // Log compaction files are optional, derived optimization files. They are cleaned up in a
+      // separate pass (NOT through the BufferingLogDeletionIterator) so that they can never
+      // influence the retention decisions for actual commit/checkpoint/checksum files, which is
+      // critical because incorrectly deleting those would corrupt the table.
+      numDeleted += listExpiredCompactionDeltaFiles(fileCutOffTime.getTime)
+        .count(file => fs.delete(file.getPath, false))
       val commitDirPath = FileNames.commitDirPath(logPath)
       // Commit Directory might not exist on tables created in older versions and
       // never updated since.
@@ -171,26 +177,36 @@ trait MetadataCleanup extends DeltaLogging {
     if (latestCheckpoint.isEmpty) return Iterator.empty
     val threshold = latestCheckpoint.get.version - 1L
     val files = store.listFrom(listingPrefix(logPath, 0), newDeltaHadoopConf())
-      .filter(f =>
-        isCheckpointFile(f) || isDeltaFile(f) || isChecksumFile(f) || isCompactedDeltaFile(f))
+      .filter(f => isCheckpointFile(f) || isDeltaFile(f) || isChecksumFile(f))
 
     new BufferingLogDeletionIterator(
-      files, fileCutOffTime, threshold, getFileVersionForCleanup)
+      files, fileCutOffTime, threshold, getDeltaFileChecksumOrCheckpointVersion)
   }
 
   /**
-   * Helper function for getting the version of a file for cleanup purposes.
-   * Supports checkpoint, delta, checksum, and compacted delta files.
+   * Returns the [[log compaction files]] (`<x>.<y>.compacted.json`) that can be cleaned up. A
+   * compaction file is expired when:
+   *  - its start version is at or before the latest checkpoint, meaning the checkpoint already
+   *    subsumes the commits it covers, so it can no longer be used by readers (see
+   *    `useCompactedDeltasForLogSegment`), and
+   *  - it is older than `fileCutOffTime`.
+   *
+   * Compaction files are listed and deleted independently of the delta/checkpoint/checksum files
+   * (which use [[BufferingLogDeletionIterator]] for time-travel timestamp adjustment). A compaction
+   * file spans a `[startVersion, endVersion]` range rather than a single commit, so it must not be
+   * fed into that iterator where it could perturb the retention decisions for actual commit files.
+   * Compaction files are derived/optional and carry no time-travel semantics, so a simple
+   * version + age filter is both correct and safe.
    */
-  private def getFileVersionForCleanup(filePath: Path): Long = {
-    if (isCompactedDeltaFile(filePath)) {
-      // For compacted delta files, use the start version for cleanup ordering.
-      // A compacted delta x.y.compacted.json should be deleted when all commits
-      // up to its start version are expired.
-      compactedDeltaVersions(filePath)._1
-    } else {
-      getDeltaFileChecksumOrCheckpointVersion(filePath)
-    }
+  private def listExpiredCompactionDeltaFiles(fileCutOffTime: Long): Iterator[FileStatus] = {
+    val latestCheckpoint = readLastCheckpointFile()
+    if (latestCheckpoint.isEmpty) return Iterator.empty
+    val threshold = latestCheckpoint.get.version - 1L
+    store.listFrom(listingPrefix(logPath, 0), newDeltaHadoopConf())
+      .filter(isCompactedDeltaFile)
+      .filter { file =>
+        file.getModificationTime <= fileCutOffTime && compactedDeltaVersions(file)._1 <= threshold
+      }
   }
 
   protected def checkpointExistsAtCleanupBoundary(deltaLog: DeltaLog, version: Long): Boolean = {

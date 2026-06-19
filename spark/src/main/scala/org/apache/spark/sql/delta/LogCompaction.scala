@@ -70,8 +70,15 @@ object LogCompaction extends DeltaLogging {
 
     (startVersion to endVersion).foreach { version =>
       val file = fileProvider.deltaFile(version)
-      val actionsIterator = deltaLog.store.readAsIterator(file, hadoopConf).map(Action.fromJson)
-      logReplay.append(version, actionsIterator)
+      // `readAsIterator` returns a ClosableIterator backed by an open input stream. Keep a
+      // reference to it (rather than chaining `.map`, which discards the close handle) and close
+      // it explicitly so the stream is released even if reconciliation is interrupted mid-file.
+      val actions = deltaLog.store.readAsIterator(file, hadoopConf)
+      try {
+        logReplay.append(version, actions.map(Action.fromJson))
+      } finally {
+        actions.close()
+      }
     }
 
     val compactedFilePath =
