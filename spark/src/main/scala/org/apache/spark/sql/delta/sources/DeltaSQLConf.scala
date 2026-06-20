@@ -2948,7 +2948,7 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
         "and do not require any protocol or table feature upgrade.")
       .internal()
       .booleanConf
-      .createWithDefault(false)
+      .createWithDefault(true)
 
   val DELTALOG_LOG_COMPACTION_INTERVAL =
     buildConf("deltaLog.logCompaction.interval")

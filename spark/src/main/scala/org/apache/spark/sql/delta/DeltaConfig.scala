@@ -479,7 +479,7 @@ trait DeltaConfigsBase extends DeltaLogging {
   /** How often to checkpoint the delta log. */
   val CHECKPOINT_INTERVAL = buildConfig[Int](
     "checkpointInterval",
-    "10",
+    "20",
     _.toInt,
     _ > 0,
     "needs to be a positive integer.")

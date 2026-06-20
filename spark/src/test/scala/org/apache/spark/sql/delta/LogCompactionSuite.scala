@@ -73,14 +73,29 @@ class LogCompactionSuite extends QueryTest
     deltaLog
   }
 
-  test("log compaction is disabled by default") {
+  test("log compaction can be disabled") {
     withSQLConf(
+      DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED.key -> "false",
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
       withTempDir { dir =>
         val path = dir.getCanonicalPath
         val deltaLog = commitUpToVersion(path, 12)
         assert(compactedRanges(deltaLog).isEmpty,
           "no compaction files should be produced when the feature is disabled")
+      }
+    }
+  }
+
+  test("log compaction is enabled by default") {
+    // Relies on the default `DELTALOG_LOG_COMPACTION_ENABLED = true`; a checkpoint interval larger
+    // than the compaction interval is still required for the hook to actually produce a compaction.
+    withSQLConf(
+      DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        val deltaLog = commitUpToVersion(path, 10)
+        assert(compactedRanges(deltaLog) === Seq((1L, 10L)),
+          "compaction should be produced with the default configuration")
       }
     }
   }
