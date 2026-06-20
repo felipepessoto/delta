@@ -43,7 +43,7 @@ class DeltaLogMinorCompactionSuite extends QueryTest
   // automatically produced compaction files don't interfere with the precise sets asserted here.
   // The write path is covered by LogCompactionSuite.
   override protected def sparkConf: SparkConf =
-    super.sparkConf.set(DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED.key, "false")
+    super.sparkConf.set(DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key, "false")
 
   /** Helper method to do minor compaction of [[DeltaLog]] from [startVersion, endVersion] */
   private def minorCompactDeltaLog(

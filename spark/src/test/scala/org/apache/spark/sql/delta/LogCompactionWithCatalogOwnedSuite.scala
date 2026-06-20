@@ -46,8 +46,8 @@ class LogCompactionWithCatalogOwnedSuite extends QueryTest
 
   test("hook backfills then compacts, producing compactions over published versions") {
     withSQLConf(
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED.key -> "true",
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_INTERVAL.key -> "5",
+      DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key -> "true",
+      DeltaConfigs.LOG_COMPACTION_INTERVAL.defaultTablePropertyKey -> "5",
       // High checkpoint interval so no checkpoint interferes with the produced windows.
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
       withTempDir { dir =>

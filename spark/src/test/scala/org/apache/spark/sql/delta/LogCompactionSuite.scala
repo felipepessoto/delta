@@ -75,7 +75,7 @@ class LogCompactionSuite extends QueryTest
 
   test("log compaction can be disabled") {
     withSQLConf(
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED.key -> "false",
+      DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key -> "false",
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
       withTempDir { dir =>
         val path = dir.getCanonicalPath
@@ -87,8 +87,8 @@ class LogCompactionSuite extends QueryTest
   }
 
   test("log compaction is enabled by default") {
-    // Relies on the default `DELTALOG_LOG_COMPACTION_ENABLED = true`; a checkpoint interval larger
-    // than the compaction interval is still required for the hook to actually produce a compaction.
+    // Relies on the default `deltaLog.minorCompaction.useForWrites = true`; a checkpoint interval
+    // larger than the compaction interval is still required for the hook to produce a compaction.
     withSQLConf(
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
       withTempDir { dir =>
@@ -102,8 +102,8 @@ class LogCompactionSuite extends QueryTest
 
   test("hook produces non-overlapping fixed windows at the configured interval") {
     withSQLConf(
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED.key -> "true",
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_INTERVAL.key -> "5",
+      DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key -> "true",
+      DeltaConfigs.LOG_COMPACTION_INTERVAL.defaultTablePropertyKey -> "5",
       // High checkpoint interval so no checkpoint interferes with the windows.
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
       withTempDir { dir =>
@@ -118,8 +118,8 @@ class LogCompactionSuite extends QueryTest
 
   test("produced compaction files are used for snapshot construction and preserve state") {
     withSQLConf(
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED.key -> "true",
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_INTERVAL.key -> "5",
+      DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key -> "true",
+      DeltaConfigs.LOG_COMPACTION_INTERVAL.defaultTablePropertyKey -> "5",
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
       withTempDir { dir =>
         val path = dir.getCanonicalPath
@@ -153,8 +153,8 @@ class LogCompactionSuite extends QueryTest
 
   test("a checkpoint subsumes compaction and bounds the next window") {
     withSQLConf(
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED.key -> "true",
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_INTERVAL.key -> "5",
+      DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key -> "true",
+      DeltaConfigs.LOG_COMPACTION_INTERVAL.defaultTablePropertyKey -> "5",
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "10") {
       withTempDir { dir =>
         val path = dir.getCanonicalPath
@@ -181,8 +181,8 @@ class LogCompactionSuite extends QueryTest
 
   test("no compaction is produced before a full window of commits exists") {
     withSQLConf(
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED.key -> "true",
-      DeltaSQLConf.DELTALOG_LOG_COMPACTION_INTERVAL.key -> "5",
+      DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key -> "true",
+      DeltaConfigs.LOG_COMPACTION_INTERVAL.defaultTablePropertyKey -> "5",
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
       withTempDir { dir =>
         val path = dir.getCanonicalPath

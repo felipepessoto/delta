@@ -25,10 +25,11 @@ import org.apache.spark.sql.SparkSession
  * Post-commit hook that creates log compaction files (`<x>.<y>.compacted.json`) to speed up
  * snapshot construction without the cost of a full checkpoint.
  *
- * When enabled (`deltaLog.logCompaction.enabled`), after a commit whose version is a multiple of
- * the configured interval (`deltaLog.logCompaction.interval`), this hook reconciles the most recent
- * window of commits into a single compaction file. The window is `[startVersion, committedVersion]`
- * where `startVersion = max(committedVersion - interval + 1, lastCheckpointVersion + 1)`. Bounding
+ * When enabled (`deltaLog.minorCompaction.useForWrites`), after a commit whose version is a
+ * multiple of the configured interval (table property `delta.logCompactionInterval`), this hook
+ * reconciles the most recent window of commits into a single compaction file. The window is
+ * `[startVersion, committedVersion]` where
+ * `startVersion = max(committedVersion - interval + 1, lastCheckpointVersion + 1)`. Bounding
  * the window below by the last checkpoint avoids producing a compaction that spans (and is thus
  * subsumed by) a checkpoint.
  *
@@ -54,12 +55,13 @@ object LogCompactionHook extends PostCommitHook {
   override val name: String = "Post commit log compaction"
 
   override def run(spark: SparkSession, txn: CommittedTransaction): Unit = {
-    if (!spark.conf.get(DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED)) return
+    if (!spark.conf.get(DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES)) return
     // A checkpoint already subsumes the commits a compaction would cover, so skip when one was
     // just written for this commit.
     if (txn.needsCheckpoint) return
 
-    val interval = spark.conf.get(DeltaSQLConf.DELTALOG_LOG_COMPACTION_INTERVAL)
+    val interval =
+      DeltaConfigs.LOG_COMPACTION_INTERVAL.fromMetaData(txn.postCommitSnapshot.metadata)
     val endVersion = txn.committedVersion
     // Only compact on interval boundaries to keep the produced windows non-overlapping.
     if (endVersion <= 0 || endVersion % interval != 0) return
