@@ -18,7 +18,6 @@ package org.apache.spark.sql.delta.hooks
 
 import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
-import org.apache.spark.sql.delta.util.DeltaCommitFileProvider
 
 import org.apache.spark.sql.SparkSession
 
@@ -41,6 +40,11 @@ import org.apache.spark.sql.SparkSession
  * If a checkpoint was just written for this commit, the hook does nothing, because a checkpoint
  * already subsumes the commits a compaction would cover.
  *
+ * Per the protocol, compaction files (like checkpoints) may only be produced for commit versions
+ * already published in `_delta_log`. On catalog-managed / coordinated-commits tables the hook
+ * therefore synchronously backfills the window's commits before compacting, mirroring how
+ * checkpoint writing publishes commits via `Snapshot.ensureCommitFilesBackfilled`.
+ *
  * Log compaction files are optional and do not require any protocol or table-feature upgrade.
  * Readers that support compacted deltas (`deltaLog.minorCompaction.useForReads`) use them to speed
  * up snapshot construction; readers that don't simply ignore them.
@@ -60,20 +64,6 @@ object LogCompactionHook extends PostCommitHook {
     // Only compact on interval boundaries to keep the produced windows non-overlapping.
     if (endVersion <= 0 || endVersion % interval != 0) return
 
-    // Per the protocol, a log compaction file may only be produced for versions already published
-    // (backfilled) in `_delta_log` (i.e. `_delta_log/<v>.json` must exist for every `v` in the
-    // range). On coordinated-commits / catalog-managed tables recent commits may still be staged
-    // under `_delta_log/_staged_commits`, and the snapshot tracks committed versions via those
-    // staged files. We therefore conservatively skip compaction whenever the window may include a
-    // version that is not represented as published in the snapshot; maintenance of catalog-managed
-    // tables is expected to be coordinated by the catalog instead. `minUnbackfilledVersion` is the
-    // lowest staged version (or `snapshot.version + 1` when nothing is staged, e.g. on filesystem-
-    // based tables), and unpublished versions form a suffix, so the window is published iff
-    // `endVersion < minUnbackfilledVersion`. This is a no-op on filesystem-based tables.
-    val minUnbackfilledVersion =
-      DeltaCommitFileProvider(txn.postCommitSnapshot).minUnbackfilledVersion
-    if (endVersion >= minUnbackfilledVersion) return
-
     // Don't start a compaction at or before the latest checkpoint: those commits are already
     // subsumed by the checkpoint, so such a compaction would never be used by the reader.
     val checkpointVersion = txn.postCommitSnapshot.logSegment.checkpointProvider.version
@@ -81,6 +71,15 @@ object LogCompactionHook extends PostCommitHook {
 
     // Need at least two commits in the range to produce a useful compaction.
     if (endVersion <= startVersion) return
+
+    // Per the protocol, a log compaction file may only be produced for versions already published
+    // (backfilled) in `_delta_log` (i.e. `_delta_log/<v>.json` must exist for every `v` in the
+    // range). On coordinated-commits / catalog-managed tables recent commits may still be staged
+    // under `_delta_log/_staged_commits`, so we synchronously backfill them first - the same way
+    // checkpoint writing ensures published commits (see `Snapshot.ensureCommitFilesBackfilled`,
+    // invoked from `Checkpoints.writeCheckpointFiles`). This is a no-op on filesystem-based tables
+    // (no commit coordinator).
+    txn.postCommitSnapshot.ensureCommitFilesBackfilled(txn.catalogTable)
 
     LogCompaction.compact(txn.deltaLog, txn.postCommitSnapshot, startVersion, endVersion)
   }

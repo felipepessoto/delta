@@ -31,27 +31,28 @@ import org.apache.spark.sql.test.SharedSparkSession
  * Tables").
  *
  * On catalog-managed (catalog-owned / coordinated-commits) tables, committed versions can still be
- * staged under `_delta_log/_staged_commits`, and the snapshot tracks them via those staged files.
- * The hook therefore conservatively skips compaction for such tables (their maintenance is meant to
- * be coordinated by the catalog), so that it never produces a compaction over an unpublished
- * version. This suite locks in that behavior.
+ * staged under `_delta_log/_staged_commits`. The hook synchronously backfills the window's commits
+ * before compacting (the same way checkpoint writing publishes commits via
+ * `Snapshot.ensureCommitFilesBackfilled`), so every produced compaction covers only published
+ * versions.
  */
 class LogCompactionWithCatalogOwnedSuite extends QueryTest
   with SharedSparkSession
   with DeltaSQLCommandTest
   with CatalogOwnedTestBaseSuite {
 
-  // Batched backfill so committed versions are staged when their post-commit hook runs.
+  // Batched backfill so committed versions would otherwise be staged when the hook runs.
   override def catalogOwnedCoordinatorBackfillBatchSize: Option[Int] = Some(2)
 
-  test("hook does not produce compactions on catalog-managed tables (commits may be staged)") {
+  test("hook backfills then compacts, producing compactions over published versions") {
     withSQLConf(
       DeltaSQLConf.DELTALOG_LOG_COMPACTION_ENABLED.key -> "true",
       DeltaSQLConf.DELTALOG_LOG_COMPACTION_INTERVAL.key -> "5",
+      // High checkpoint interval so no checkpoint interferes with the produced windows.
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
       withTempDir { dir =>
         val path = dir.getCanonicalPath
-        (0L to 20L).foreach { v =>
+        (0L to 10L).foreach { v =>
           spark.range(v, v + 1).write.format("delta").mode("append").save(path)
         }
         val deltaLog = DeltaLog.forTable(spark, path)
@@ -59,17 +60,25 @@ class LogCompactionWithCatalogOwnedSuite extends QueryTest
 
         val compactions = fs.listStatus(deltaLog.logPath)
           .filter(FileNames.isCompactedDeltaFile)
-          .map(_.getPath.getName)
+          .map(f => FileNames.compactedDeltaVersions(f.getPath))
           .sorted
 
-        // The hook must not produce any compaction file here: that would require compacting a
-        // version that the snapshot still tracks as staged (unpublished).
-        assert(compactions.isEmpty,
-          s"expected no compaction files on a catalog-managed table, found: " +
-            s"${compactions.mkString(", ")}")
+        // The hook backfills before compacting, so it produces the same windows it would on a
+        // filesystem table: v5 -> [1, 5] and v10 -> [6, 10].
+        assert(compactions.toSeq === Seq((1L, 5L), (6L, 10L)))
 
-        // The table still reads correctly.
-        checkAnswer(spark.read.format("delta").load(path), spark.range(21).toDF())
+        // Every produced compaction must cover only published (backfilled) versions: the backfilled
+        // `_delta_log/<endVersion>.json` must exist.
+        compactions.foreach { case (startV, endV) =>
+          assert(fs.exists(FileNames.unsafeDeltaFile(deltaLog.logPath, endV)),
+            s"compaction [$startV, $endV] covers a non-published (unbackfilled) end version")
+        }
+
+        // The compaction files are used for snapshot construction and the table reads correctly.
+        DeltaLog.clearCache()
+        val snapshot = DeltaLog.forTable(spark, path).unsafeVolatileSnapshot
+        assert(snapshot.logSegment.deltas.exists(f => FileNames.isCompactedDeltaFile(f.getPath)))
+        checkAnswer(spark.read.format("delta").load(path), spark.range(11).toDF())
       }
     }
   }
