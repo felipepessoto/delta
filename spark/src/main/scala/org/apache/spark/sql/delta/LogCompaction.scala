@@ -41,6 +41,17 @@ import org.apache.spark.internal.MDC
  */
 object LogCompaction extends DeltaLogging {
 
+  /** opType under which all log compaction telemetry is recorded. */
+  private[delta] val OP_TYPE = "delta.logCompaction"
+
+  // Possible values of `LogCompactionMetrics.status`.
+  private[delta] val STATUS_COMPLETED = "completed"
+  private[delta] val STATUS_SKIPPED = "skipped"
+
+  // Possible values of `LogCompactionMetrics.skipReason` (only set when status is "skipped").
+  private[delta] val SKIP_REASON_TARGET_EXISTS = "targetAlreadyExists"
+  private[delta] val SKIP_REASON_CONCURRENT_WRITE = "concurrentlyCreated"
+
   /**
    * Creates a log compaction file for the table covering commits `[startVersion, endVersion]`
    * (both inclusive). The resulting file contains the reconciled actions for the range (following
@@ -54,6 +65,10 @@ object LogCompaction extends DeltaLogging {
    * exists (idempotent): the common case is short-circuited by an existence check that avoids
    * redundant reconciliation, and the write itself uses `overwrite = false` so a concurrent writer
    * that produced the same (deterministic) file cannot be clobbered.
+   *
+   * Each invocation emits a `delta.logCompaction.stats` telemetry event (see
+   * [[LogCompactionMetrics]]) capturing the outcome (completed / skipped with a reason), duration,
+   * number of commits and actions, and the resulting file size.
    *
    * @param deltaLog The [[DeltaLog]] instance for the table.
    * @param snapshot A snapshot at or after `endVersion`, used to resolve commit file paths.
@@ -73,6 +88,9 @@ object LogCompaction extends DeltaLogging {
     val compactedFilePath =
       FileNames.compactedDeltaFile(deltaLog.logPath, startVersion, endVersion)
     val fs = deltaLog.logPath.getFileSystem(hadoopConf)
+    val startTimeMs = System.currentTimeMillis()
+    def elapsedMs: Long = System.currentTimeMillis() - startTimeMs
+
     // Idempotency fast path: skip the (potentially expensive) reconciliation and write if the
     // compaction file for this exact range already exists, e.g. because a concurrent writer
     // already produced it. This avoids recomputing the file in the common case; the write below
@@ -81,6 +99,12 @@ object LogCompaction extends DeltaLogging {
       logInfo(
         log"Skipping log compaction; file already exists " +
         log"${MDC(DeltaLogKeys.PATH, compactedFilePath)}")
+      recordCompactionStats(deltaLog, LogCompactionMetrics(
+        startVersion = startVersion,
+        endVersion = endVersion,
+        status = STATUS_SKIPPED,
+        durationMs = elapsedMs,
+        skipReason = Some(SKIP_REASON_TARGET_EXISTS)))
       return
     }
 
@@ -102,6 +126,13 @@ object LogCompaction extends DeltaLogging {
       }
     }
 
+    // Count the reconciled actions as a side effect while the store consumes the iterator below.
+    var numActions = 0L
+    val actionsToWrite = logReplay.checkpoint.map { action =>
+      numActions += 1
+      action.json
+    }
+
     // Write with overwrite = false so that, in the residual race where another writer produced the
     // same compaction file between the existence check above and this write, we don't clobber it.
     // The reconciled content for a given [startVersion, endVersion] range is deterministic, so an
@@ -110,7 +141,7 @@ object LogCompaction extends DeltaLogging {
     try {
       deltaLog.store.write(
         path = compactedFilePath,
-        actions = logReplay.checkpoint.map(_.json),
+        actions = actionsToWrite,
         overwrite = false,
         hadoopConf = hadoopConf)
     } catch {
@@ -118,8 +149,23 @@ object LogCompaction extends DeltaLogging {
         logInfo(
           log"Skipping log compaction; file already exists " +
           log"${MDC(DeltaLogKeys.PATH, compactedFilePath)}")
+        recordCompactionStats(deltaLog, LogCompactionMetrics(
+          startVersion = startVersion,
+          endVersion = endVersion,
+          status = STATUS_SKIPPED,
+          durationMs = elapsedMs,
+          skipReason = Some(SKIP_REASON_CONCURRENT_WRITE)))
         return
     }
+
+    recordCompactionStats(deltaLog, LogCompactionMetrics(
+      startVersion = startVersion,
+      endVersion = endVersion,
+      status = STATUS_COMPLETED,
+      durationMs = elapsedMs,
+      numCommitsCompacted = endVersion - startVersion + 1,
+      numActions = numActions,
+      compactedFileSizeBytes = fs.getFileStatus(compactedFilePath).getLen))
 
     logInfo(
       log"Created log compaction file " +
@@ -127,4 +173,31 @@ object LogCompaction extends DeltaLogging {
       log"for versions [${MDC(DeltaLogKeys.START_VERSION, startVersion)}, " +
       log"${MDC(DeltaLogKeys.END_VERSION, endVersion)}]")
   }
+
+  /** Emits a single log compaction telemetry event. */
+  private def recordCompactionStats(deltaLog: DeltaLog, metrics: LogCompactionMetrics): Unit =
+    recordDeltaEvent(deltaLog, opType = s"$OP_TYPE.stats", data = metrics)
 }
+
+/**
+ * Telemetry for a single [[LogCompaction.compact]] invocation, emitted as the JSON blob of the
+ * `delta.logCompaction.stats` event.
+ *
+ * @param startVersion The (inclusive) start version of the compaction range.
+ * @param endVersion The (inclusive) end version of the compaction range.
+ * @param status `completed` if a file was written, `skipped` if it already existed.
+ * @param durationMs Wall-clock time spent in `compact`, in milliseconds.
+ * @param skipReason When `status == skipped`, why it was skipped (see `SKIP_REASON_*`).
+ * @param numCommitsCompacted Number of commit files reconciled into the compaction file.
+ * @param numActions Number of actions written to the compaction file.
+ * @param compactedFileSizeBytes Size of the written compaction file, in bytes.
+ */
+case class LogCompactionMetrics(
+    startVersion: Long,
+    endVersion: Long,
+    status: String,
+    durationMs: Long,
+    skipReason: Option[String] = None,
+    numCommitsCompacted: Long = 0L,
+    numActions: Long = 0L,
+    compactedFileSizeBytes: Long = 0L)

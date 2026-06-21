@@ -20,7 +20,7 @@ import org.apache.spark.sql.delta.actions.{Action, AddFile, CommitInfo}
 import org.apache.spark.sql.delta.hooks.LogCompactionHook
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
-import org.apache.spark.sql.delta.util.FileNames
+import org.apache.spark.sql.delta.util.{FileNames, JsonUtils}
 
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.test.SharedSparkSession
@@ -241,6 +241,41 @@ class LogCompactionSuite extends QueryTest
         // The existing file must be left untouched: `compact` skips when the target exists.
         assert(deltaLog.store.read(compactedPath, hadoopConf).toSeq === Seq(sentinel),
           "an existing compaction file should not be recomputed or overwritten")
+      }
+    }
+  }
+
+  test("LogCompaction.compact emits telemetry for completed and skipped compactions") {
+    withSQLConf(
+      DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        val deltaLog = commitUpToVersion(path, 5)
+        val snapshot = deltaLog.update()
+
+        // A completed compaction reports the range, commit/action counts, and file size.
+        val completedLogs = DeltaTestUtils.collectUsageLogs("delta.logCompaction.stats") {
+          LogCompaction.compact(deltaLog, snapshot, startVersion = 1, endVersion = 4)
+        }
+        assert(completedLogs.size === 1, "exactly one stats event should be emitted")
+        val completed =
+          JsonUtils.mapper.readValue[LogCompactionMetrics](completedLogs.head.blob)
+        assert(completed.status === LogCompaction.STATUS_COMPLETED)
+        assert(completed.skipReason.isEmpty)
+        assert(completed.startVersion === 1 && completed.endVersion === 4)
+        assert(completed.numCommitsCompacted === 4)
+        assert(completed.numActions > 0, "the compaction should contain reconciled actions")
+        assert(completed.compactedFileSizeBytes > 0, "the written file should have a size")
+        assert(completed.durationMs >= 0)
+
+        // Compacting the same range again is skipped with the target-already-exists reason.
+        val skippedLogs = DeltaTestUtils.collectUsageLogs("delta.logCompaction.stats") {
+          LogCompaction.compact(deltaLog, snapshot, startVersion = 1, endVersion = 4)
+        }
+        assert(skippedLogs.size === 1)
+        val skipped = JsonUtils.mapper.readValue[LogCompactionMetrics](skippedLogs.head.blob)
+        assert(skipped.status === LogCompaction.STATUS_SKIPPED)
+        assert(skipped.skipReason === Some(LogCompaction.SKIP_REASON_TARGET_EXISTS))
       }
     }
   }
