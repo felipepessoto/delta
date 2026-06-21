@@ -201,7 +201,11 @@ trait MetadataCleanup extends DeltaLogging {
   private def listExpiredCompactionDeltaFiles(fileCutOffTime: Long): Iterator[FileStatus] = {
     val latestCheckpoint = readLastCheckpointFile()
     if (latestCheckpoint.isEmpty) return Iterator.empty
-    val threshold = latestCheckpoint.get.version - 1L
+    // A compaction file is usable by readers only while its start version is strictly after the
+    // checkpoint (it tiles the deltas the checkpoint does not cover). Once the start version is at
+    // or before the checkpoint version the file is subsumed and can be deleted, matching the
+    // protocol's `startVersion <= cutOffCheckpoint.version` rule.
+    val threshold = latestCheckpoint.get.version
     store.listFrom(listingPrefix(logPath, 0), newDeltaHadoopConf())
       .filter(isCompactedDeltaFile)
       .filter { file =>

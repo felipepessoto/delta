@@ -352,15 +352,18 @@ class DeltaRetentionSuite extends QueryTest
         log.startTransaction().commit(createTestAddFile(encodedPath = i.toString) :: Nil, testOp)
       }
       LogCompaction.compact(log, log.update(), startVersion = 5, endVersion = 6)
+      // A compaction whose start version equals the checkpoint version (4) is also subsumed by the
+      // checkpoint and must be deleted (boundary of the `startVersion <= checkpointVersion` rule).
+      LogCompaction.compact(log, log.update(), startVersion = 4, endVersion = 6)
 
-      assert(compactedRanges() === Set((1L, 3L), (5L, 6L)))
+      assert(compactedRanges() === Set((1L, 3L), (4L, 6L), (5L, 6L)))
 
       clock.advance(intervalStringToMillis(DeltaConfigs.LOG_RETENTION.defaultValue) +
         intervalStringToMillis("interval 1 day"))
       log.cleanUpExpiredLogs(log.update())
 
-      // The [1, 3] compaction (start version <= the cutoff checkpoint version 4) is deleted, while
-      // the [5, 6] compaction (start version after the checkpoint) is retained.
+      // The [1, 3] and [4, 6] compactions (start version <= the cutoff checkpoint version 4) are
+      // deleted, while the [5, 6] compaction (start version after the checkpoint) is retained.
       assert(compactedRanges() === Set((5L, 6L)))
       // Sanity check: the pre-checkpoint commit files were also cleaned up.
       assert(!getFileVersions(getDeltaFiles(logPath)).contains(1L))

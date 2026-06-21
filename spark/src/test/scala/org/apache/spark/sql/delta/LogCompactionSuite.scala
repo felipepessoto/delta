@@ -16,7 +16,7 @@
 
 package org.apache.spark.sql.delta
 
-import org.apache.spark.sql.delta.actions.{Action, AddFile, CommitInfo}
+import org.apache.spark.sql.delta.actions.{Action, AddFile, CommitInfo, DomainMetadata, SetTransaction}
 import org.apache.spark.sql.delta.hooks.LogCompactionHook
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
@@ -276,6 +276,80 @@ class LogCompactionSuite extends QueryTest
         val skipped = JsonUtils.mapper.readValue[LogCompactionMetrics](skippedLogs.head.blob)
         assert(skipped.status === LogCompaction.STATUS_SKIPPED)
         assert(skipped.skipReason === Some(LogCompaction.SKIP_REASON_TARGET_EXISTS))
+      }
+    }
+  }
+
+  test("compaction preserves non-trivial action types (DVs, row tracking, domain metadata, txn)") {
+    withSQLConf(
+      // Keep versions deterministic: no auto-compaction, and no checkpoint within the range.
+      DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key -> "false",
+      DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        // Deletion vectors + row tracking produce non-trivial actions (DV-bearing AddFiles and
+        // per-file baseRowId); domainMetadata is enabled explicitly so the raw DomainMetadata
+        // commit below is allowed.
+        sql(
+          s"""CREATE TABLE delta.`$path` (id LONG) USING delta TBLPROPERTIES (
+             |  'delta.enableDeletionVectors' = 'true',
+             |  'delta.enableRowTracking' = 'true',
+             |  'delta.feature.domainMetadata' = 'supported')""".stripMargin)
+        spark.range(0, 50).write.format("delta").mode("append").save(path)   // v1
+        spark.range(50, 100).write.format("delta").mode("append").save(path) // v2
+        // v3: a partial-file delete produces deletion vectors.
+        sql(s"DELETE FROM delta.`$path` WHERE id IN (3, 60)")
+
+        val deltaLog = DeltaLog.forTable(spark, path)
+        // v4: an explicit domain metadata and a transaction identifier, committed directly.
+        deltaLog.startTransaction().commit(
+          Seq(
+            DomainMetadata("test.compaction.domain", """{"k":"v"}""", removed = false),
+            SetTransaction("app-id", 7, Some(123L))),
+          DeltaOperations.ManualUpdate)
+
+        val endVersion = deltaLog.update().version
+        LogCompaction.compact(
+          deltaLog, deltaLog.update(), startVersion = 1, endVersion = endVersion)
+
+        // The compaction file must preserve every non-trivial action type.
+        val compactedPath = FileNames.compactedDeltaFile(deltaLog.logPath, 1, endVersion)
+        val actions = deltaLog.store
+          .read(compactedPath, deltaLog.newDeltaHadoopConf())
+          .map(Action.fromJson)
+        val addFiles = actions.collect { case a: AddFile => a }
+        assert(addFiles.exists(_.deletionVector != null),
+          "a deletion-vector-bearing AddFile must be preserved")
+        assert(addFiles.exists(_.baseRowId.isDefined),
+          "row-tracking baseRowId must be preserved on AddFiles")
+        assert(
+          actions.collect { case d: DomainMetadata => d.domain }.contains("test.compaction.domain"),
+          "domain metadata must be preserved")
+        assert(
+          actions.collect { case s: SetTransaction => s }
+            .exists(s => s.appId == "app-id" && s.version == 7),
+          "the transaction identifier must be preserved")
+        assert(actions.forall(!_.isInstanceOf[CommitInfo]), "commitInfo must be stripped")
+
+        // The snapshot built from the compaction must be identical to one built from raw commits.
+        DeltaLog.clearCache()
+        val compactedSnapshot = DeltaLog.forTable(spark, path).unsafeVolatileSnapshot
+        assert(
+          compactedSnapshot.logSegment.deltas.exists(f =>
+            FileNames.isCompactedDeltaFile(f.getPath)),
+          "the snapshot should be backed by the compaction file")
+        withSQLConf(DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_READS.key -> "false") {
+          DeltaLog.clearCache()
+          val rawSnapshot = DeltaLog.forTable(spark, path).unsafeVolatileSnapshot
+          assert(rawSnapshot.computeChecksum === compactedSnapshot.computeChecksum)
+          checkAnswer(compactedSnapshot.allFiles.toDF(), rawSnapshot.allFiles.toDF())
+          assert(compactedSnapshot.domainMetadata.toSet === rawSnapshot.domainMetadata.toSet)
+          assert(compactedSnapshot.setTransactions.toSet === rawSnapshot.setTransactions.toSet)
+        }
+
+        // The data must read back correctly (deleted rows excluded).
+        checkAnswer(spark.read.format("delta").load(path),
+          spark.range(0, 100).where("id NOT IN (3, 60)").toDF())
       }
     }
   }
