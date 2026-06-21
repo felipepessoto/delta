@@ -111,7 +111,10 @@ object LogCompaction extends DeltaLogging {
     val fileProvider = DeltaCommitFileProvider(snapshot)
     val logReplay = new InMemoryLogReplay(
       minFileRetentionTimestamp = None,
-      minSetTransactionRetentionTimestamp = None)
+      minSetTransactionRetentionTimestamp = None,
+      // A compaction file incrementally replaces its commit range, so (unlike a checkpoint) it
+      // must retain `removed = true` DomainMetadata tombstones to suppress earlier adds.
+      retainDomainMetadataTombstones = true)
 
     (startVersion to endVersion).foreach { version =>
       val file = fileProvider.deltaFile(version)

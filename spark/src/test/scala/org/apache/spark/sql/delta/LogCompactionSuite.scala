@@ -353,4 +353,58 @@ class LogCompactionSuite extends QueryTest
       }
     }
   }
+
+  test("compaction retains a domain metadata removal whose add precedes the window") {
+    withSQLConf(
+      DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key -> "false",
+      DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        sql(s"CREATE TABLE delta.`$path` (id LONG) USING delta " +
+          "TBLPROPERTIES ('delta.feature.domainMetadata' = 'supported')")           // v0
+        val deltaLog = DeltaLog.forTable(spark, path)
+        // v1: add the domain - this is OUTSIDE the compacted window below.
+        deltaLog.startTransaction().commit(
+          Seq(DomainMetadata("test.domain", """{"k":"v"}""", removed = false)),
+          DeltaOperations.ManualUpdate)
+        // v2: remove the domain - this is INSIDE the compacted window.
+        deltaLog.startTransaction().commit(
+          Seq(DomainMetadata("test.domain", "", removed = true)),
+          DeltaOperations.ManualUpdate)
+        spark.range(0, 1).write.format("delta").mode("append").save(path)           // v3
+
+        val endVersion = deltaLog.update().version
+        // Compact [2, endVersion]: the window contains the removal but NOT the original add.
+        LogCompaction.compact(
+          deltaLog, deltaLog.update(), startVersion = 2, endVersion = endVersion)
+
+        // The compaction file must carry the removal tombstone (like a RemoveFile tombstone) so it
+        // suppresses the earlier add when it replaces the commit range.
+        val compactedPath = FileNames.compactedDeltaFile(deltaLog.logPath, 2, endVersion)
+        val actions = deltaLog.store
+          .read(compactedPath, deltaLog.newDeltaHadoopConf())
+          .map(Action.fromJson)
+        assert(
+          actions.collect { case d: DomainMetadata if d.removed => d.domain }
+            .contains("test.domain"),
+          "the removal tombstone for an out-of-window domain add must be preserved")
+
+        // The compaction-backed snapshot must agree with the raw-commit snapshot: domain removed.
+        DeltaLog.clearCache()
+        val compactedSnapshot = DeltaLog.forTable(spark, path).unsafeVolatileSnapshot
+        assert(
+          compactedSnapshot.logSegment.deltas.exists(f =>
+            FileNames.isCompactedDeltaFile(f.getPath)),
+          "the snapshot should be backed by the compaction file")
+        assert(!compactedSnapshot.domainMetadata.exists(_.domain == "test.domain"),
+          "the domain must be absent (removed) in the compaction-backed snapshot")
+        withSQLConf(DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_READS.key -> "false") {
+          DeltaLog.clearCache()
+          val rawSnapshot = DeltaLog.forTable(spark, path).unsafeVolatileSnapshot
+          assert(rawSnapshot.domainMetadata.map(_.domain).toSet ===
+            compactedSnapshot.domainMetadata.map(_.domain).toSet)
+        }
+      }
+    }
+  }
 }
