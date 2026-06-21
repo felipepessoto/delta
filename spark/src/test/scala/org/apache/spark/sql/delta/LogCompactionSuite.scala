@@ -407,4 +407,41 @@ class LogCompactionSuite extends QueryTest
       }
     }
   }
+
+  test("LogCompaction.compact skips a window whose commit files exceed the size guard") {
+    withSQLConf(
+      DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        val deltaLog = commitUpToVersion(path, 5)
+        val snapshot = deltaLog.update()
+        val fs = deltaLog.logPath.getFileSystem(deltaLog.newDeltaHadoopConf())
+        val compactedPath = FileNames.compactedDeltaFile(deltaLog.logPath, 1, 4)
+
+        // A 1-byte cap is exceeded by the (non-empty) window, so compaction is skipped: no file is
+        // written, and a `windowTooLarge` skip event carrying the measured window size is emitted.
+        val skippedLogs = withSQLConf(
+          DeltaSQLConf.DELTALOG_MINOR_COMPACTION_MAX_WINDOW_SIZE.key -> "1") {
+          DeltaTestUtils.collectUsageLogs("delta.logCompaction.stats") {
+            LogCompaction.compact(deltaLog, snapshot, startVersion = 1, endVersion = 4)
+          }
+        }
+        assert(!fs.exists(compactedPath),
+          "no compaction file should be written when the size guard trips")
+        assert(skippedLogs.size === 1)
+        val skipped = JsonUtils.mapper.readValue[LogCompactionMetrics](skippedLogs.head.blob)
+        assert(skipped.status === LogCompaction.STATUS_SKIPPED)
+        assert(skipped.skipReason === Some(LogCompaction.SKIP_REASON_WINDOW_TOO_LARGE))
+        assert(skipped.windowSizeBytes > 1,
+          "the measured window size should exceed the configured cap")
+
+        // With the guard disabled (non-positive threshold), the same window is compacted.
+        withSQLConf(DeltaSQLConf.DELTALOG_MINOR_COMPACTION_MAX_WINDOW_SIZE.key -> "0") {
+          LogCompaction.compact(deltaLog, snapshot, startVersion = 1, endVersion = 4)
+        }
+        assert(fs.exists(compactedPath),
+          "the window should be compacted when the size guard is disabled")
+      }
+    }
+  }
 }

@@ -21,9 +21,12 @@ import java.nio.file.FileAlreadyExistsException
 import org.apache.spark.sql.delta.actions.{Action, InMemoryLogReplay}
 import org.apache.spark.sql.delta.logging.DeltaLogKeys
 import org.apache.spark.sql.delta.metering.DeltaLogging
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.util.{DeltaCommitFileProvider, FileNames}
+import org.apache.spark.sql.delta.util.FileNames.{CompactedDeltaFile, DeltaFile}
 
 import org.apache.spark.internal.MDC
+import org.apache.spark.sql.SparkSession
 
 /**
  * Utilities for creating log compaction files. A log compaction file aggregates the actions
@@ -51,6 +54,7 @@ object LogCompaction extends DeltaLogging {
   // Possible values of `LogCompactionMetrics.skipReason` (only set when status is "skipped").
   private[delta] val SKIP_REASON_TARGET_EXISTS = "targetAlreadyExists"
   private[delta] val SKIP_REASON_CONCURRENT_WRITE = "concurrentlyCreated"
+  private[delta] val SKIP_REASON_WINDOW_TOO_LARGE = "windowTooLarge"
 
   /**
    * Creates a log compaction file for the table covering commits `[startVersion, endVersion]`
@@ -65,6 +69,10 @@ object LogCompaction extends DeltaLogging {
    * exists (idempotent): the common case is short-circuited by an existence check that avoids
    * redundant reconciliation, and the write itself uses `overwrite = false` so a concurrent writer
    * that produced the same (deterministic) file cannot be clobbered.
+   *
+   * It is also a no-op if the combined size of the window's commit files exceeds
+   * `deltaLog.minorCompaction.maxWindowSizeBytes`: reconciliation happens in a single in-memory log
+   * replay on the driver, so this bounds the driver memory a single compaction can consume.
    *
    * Each invocation emits a `delta.logCompaction.stats` telemetry event (see
    * [[LogCompactionMetrics]]) capturing the outcome (completed / skipped with a reason), duration,
@@ -105,6 +113,32 @@ object LogCompaction extends DeltaLogging {
         status = STATUS_SKIPPED,
         durationMs = elapsedMs,
         skipReason = Some(SKIP_REASON_TARGET_EXISTS)))
+      return
+    }
+
+    // Driver-memory guard: the reconciliation below replays the whole window in a single
+    // in-memory log replay on the driver (unlike checkpointing and snapshot construction, which
+    // reconcile distributedly). A window containing very large commits could therefore pressure
+    // driver memory, so skip compaction when the combined size of the window's commit files
+    // exceeds the configured threshold. The commits remain available as individual delta files and
+    // are subsumed by the next checkpoint; readers transparently fall back to them.
+    val windowSizeBytes = windowCommitSizeBytes(snapshot, startVersion, endVersion)
+    val maxWindowSizeBytes =
+      SparkSession.active.conf.get(DeltaSQLConf.DELTALOG_MINOR_COMPACTION_MAX_WINDOW_SIZE)
+    if (maxWindowSizeBytes > 0 && windowSizeBytes > maxWindowSizeBytes) {
+      logInfo(
+        log"Skipping log compaction for versions " +
+        log"[${MDC(DeltaLogKeys.START_VERSION, startVersion)}, " +
+        log"${MDC(DeltaLogKeys.END_VERSION, endVersion)}]; window size " +
+        log"${MDC(DeltaLogKeys.NUM_BYTES, windowSizeBytes)} exceeds the configured maximum " +
+        log"${MDC(DeltaLogKeys.MAX_SIZE, maxWindowSizeBytes)}")
+      recordCompactionStats(deltaLog, LogCompactionMetrics(
+        startVersion = startVersion,
+        endVersion = endVersion,
+        status = STATUS_SKIPPED,
+        durationMs = elapsedMs,
+        skipReason = Some(SKIP_REASON_WINDOW_TOO_LARGE),
+        windowSizeBytes = windowSizeBytes))
       return
     }
 
@@ -168,13 +202,32 @@ object LogCompaction extends DeltaLogging {
       durationMs = elapsedMs,
       numCommitsCompacted = endVersion - startVersion + 1,
       numActions = numActions,
-      compactedFileSizeBytes = fs.getFileStatus(compactedFilePath).getLen))
+      compactedFileSizeBytes = fs.getFileStatus(compactedFilePath).getLen,
+      windowSizeBytes = windowSizeBytes))
 
     logInfo(
       log"Created log compaction file " +
       log"${MDC(DeltaLogKeys.PATH, compactedFilePath)} " +
       log"for versions [${MDC(DeltaLogKeys.START_VERSION, startVersion)}, " +
       log"${MDC(DeltaLogKeys.END_VERSION, endVersion)}]")
+  }
+
+  /**
+   * Returns the combined size, in bytes, of the commit files for versions
+   * `[startVersion, endVersion]` as seen by `snapshot`'s log segment. Used to bound the driver
+   * memory consumed by reconciling the window. The sizes come from the already-listed
+   * [[org.apache.hadoop.fs.FileStatus]] entries, so this adds no extra file-system calls.
+   */
+  private def windowCommitSizeBytes(
+      snapshot: Snapshot,
+      startVersion: Long,
+      endVersion: Long): Long = {
+    snapshot.logSegment.deltas.iterator.collect {
+      case DeltaFile(fileStatus, version) if version >= startVersion && version <= endVersion =>
+        fileStatus.getLen
+      case CompactedDeltaFile(fileStatus, lo, hi) if lo >= startVersion && hi <= endVersion =>
+        fileStatus.getLen
+    }.sum
   }
 
   /** Emits a single log compaction telemetry event. */
@@ -194,6 +247,8 @@ object LogCompaction extends DeltaLogging {
  * @param numCommitsCompacted Number of commit files reconciled into the compaction file.
  * @param numActions Number of actions written to the compaction file.
  * @param compactedFileSizeBytes Size of the written compaction file, in bytes.
+ * @param windowSizeBytes Combined size of the window's commit files, in bytes (the value the
+ *                        driver-memory guard checks).
  */
 case class LogCompactionMetrics(
     startVersion: Long,
@@ -203,4 +258,5 @@ case class LogCompactionMetrics(
     skipReason: Option[String] = None,
     numCommitsCompacted: Long = 0L,
     numActions: Long = 0L,
-    compactedFileSizeBytes: Long = 0L)
+    compactedFileSizeBytes: Long = 0L,
+    windowSizeBytes: Long = 0L)
