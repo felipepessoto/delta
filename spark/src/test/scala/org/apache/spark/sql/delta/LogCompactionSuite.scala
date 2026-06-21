@@ -221,4 +221,27 @@ class LogCompactionSuite extends QueryTest
       }
     }
   }
+
+  test("LogCompaction.compact is a no-op when the target file already exists") {
+    withSQLConf(
+      DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        val deltaLog = commitUpToVersion(path, 5)
+        val hadoopConf = deltaLog.newDeltaHadoopConf()
+        val compactedPath = FileNames.compactedDeltaFile(deltaLog.logPath, 1, 4)
+
+        // Pre-create the compaction file with sentinel content that real reconciliation would
+        // never produce, so we can detect whether `compact` overwrote it.
+        val sentinel = """{"sentinel":"do-not-overwrite"}"""
+        deltaLog.store.write(compactedPath, Iterator(sentinel), overwrite = true, hadoopConf)
+
+        LogCompaction.compact(deltaLog, deltaLog.update(), startVersion = 1, endVersion = 4)
+
+        // The existing file must be left untouched: `compact` skips when the target exists.
+        assert(deltaLog.store.read(compactedPath, hadoopConf).toSeq === Seq(sentinel),
+          "an existing compaction file should not be recomputed or overwritten")
+      }
+    }
+  }
 }

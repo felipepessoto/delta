@@ -16,6 +16,8 @@
 
 package org.apache.spark.sql.delta
 
+import java.nio.file.FileAlreadyExistsException
+
 import org.apache.spark.sql.delta.actions.{Action, InMemoryLogReplay}
 import org.apache.spark.sql.delta.logging.DeltaLogKeys
 import org.apache.spark.sql.delta.metering.DeltaLogging
@@ -48,6 +50,11 @@ object LogCompaction extends DeltaLogging {
    * `snapshot`, so this works for both regular tables and coordinated-commits / catalog-managed
    * tables (where recent commits may live under `_delta_log/_staged_commits`).
    *
+   * This is a no-op if a compaction file for the exact `[startVersion, endVersion]` range already
+   * exists (idempotent): the common case is short-circuited by an existence check that avoids
+   * redundant reconciliation, and the write itself uses `overwrite = false` so a concurrent writer
+   * that produced the same (deterministic) file cannot be clobbered.
+   *
    * @param deltaLog The [[DeltaLog]] instance for the table.
    * @param snapshot A snapshot at or after `endVersion`, used to resolve commit file paths.
    * @param startVersion The start version of the compaction range (inclusive).
@@ -63,6 +70,20 @@ object LogCompaction extends DeltaLogging {
       s"endVersion ($endVersion) must be greater than startVersion ($startVersion)")
 
     val hadoopConf = deltaLog.newDeltaHadoopConf()
+    val compactedFilePath =
+      FileNames.compactedDeltaFile(deltaLog.logPath, startVersion, endVersion)
+    val fs = deltaLog.logPath.getFileSystem(hadoopConf)
+    // Idempotency fast path: skip the (potentially expensive) reconciliation and write if the
+    // compaction file for this exact range already exists, e.g. because a concurrent writer
+    // already produced it. This avoids recomputing the file in the common case; the write below
+    // additionally closes the residual race window atomically via overwrite = false.
+    if (fs.exists(compactedFilePath)) {
+      logInfo(
+        log"Skipping log compaction; file already exists " +
+        log"${MDC(DeltaLogKeys.PATH, compactedFilePath)}")
+      return
+    }
+
     val fileProvider = DeltaCommitFileProvider(snapshot)
     val logReplay = new InMemoryLogReplay(
       minFileRetentionTimestamp = None,
@@ -81,13 +102,24 @@ object LogCompaction extends DeltaLogging {
       }
     }
 
-    val compactedFilePath =
-      FileNames.compactedDeltaFile(deltaLog.logPath, startVersion, endVersion)
-    deltaLog.store.write(
-      path = compactedFilePath,
-      actions = logReplay.checkpoint.map(_.json),
-      overwrite = true,
-      hadoopConf = hadoopConf)
+    // Write with overwrite = false so that, in the residual race where another writer produced the
+    // same compaction file between the existence check above and this write, we don't clobber it.
+    // The reconciled content for a given [startVersion, endVersion] range is deterministic, so an
+    // already-present file is equivalent; a FileAlreadyExistsException is therefore treated as a
+    // successful no-op rather than an error.
+    try {
+      deltaLog.store.write(
+        path = compactedFilePath,
+        actions = logReplay.checkpoint.map(_.json),
+        overwrite = false,
+        hadoopConf = hadoopConf)
+    } catch {
+      case _: FileAlreadyExistsException =>
+        logInfo(
+          log"Skipping log compaction; file already exists " +
+          log"${MDC(DeltaLogKeys.PATH, compactedFilePath)}")
+        return
+    }
 
     logInfo(
       log"Created log compaction file " +
