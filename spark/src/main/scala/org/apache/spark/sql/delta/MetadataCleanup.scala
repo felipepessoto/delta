@@ -97,8 +97,9 @@ trait MetadataCleanup extends DeltaLogging {
       var numDeleted = 0
       // Expired log compaction files are peeled off the same `_delta_log` listing that drives the
       // delta/checkpoint/checksum cleanup below, so we don't pay for a second full directory
-      // listing (expensive on object stores). They are collected here and deleted separately
-      // further down, once that shared listing has been fully consumed.
+      // listing (expensive on object stores). They are collected here as that listing is consumed
+      // and deleted separately further down. See `listExpiredDeltaLogs` for the (best-effort,
+      // self-healing) semantics in the rare case where the listing is not fully traversed.
       val expiredCompactionDeltaFiles = ArrayBuffer.empty[FileStatus]
       val expiredDeltaLogs = listExpiredDeltaLogs(
         fileCutOffTime.getTime, onExpiredCompactionFile = expiredCompactionDeltaFiles += _)
@@ -129,7 +130,7 @@ trait MetadataCleanup extends DeltaLogging {
         }
       }
       // Log compaction files are optional, derived optimization files. They were peeled off the
-      // shared listing above (now fully consumed by the deletion loop) and are deleted here in a
+      // shared listing above as it was consumed by the deletion loop, and are deleted here in a
       // separate pass - never through the BufferingLogDeletionIterator - so that they can never
       // influence the retention decisions for actual commit/checkpoint/checksum files, which is
       // critical because incorrectly deleting those would corrupt the table.
@@ -182,19 +183,26 @@ trait MetadataCleanup extends DeltaLogging {
    * span a `[startVersion, endVersion]` range. They must NOT be fed into the
    * [[BufferingLogDeletionIterator]] (which adjusts time-travel timestamps per single commit and
    * whose retention decisions for real commit files could be perturbed by a range-spanning file).
-   * To avoid a second full `_delta_log` listing (expensive on object stores), expired compaction
-   * files are peeled off this same listing and reported via `onExpiredCompactionFile` for deletion
-   * in a separate pass. A compaction file is expired when:
+   * Instead, to avoid a second full `_delta_log` listing (expensive on object stores), expired
+   * compaction files are reported via `onExpiredCompactionFile` for deletion in a separate pass.
+   * A compaction file is expired when:
    *  - its start version is at or before the latest checkpoint version, meaning the checkpoint
    *    already subsumes the commits it covers so it can no longer be used by readers (see
    *    `useCompactedDeltasForLogSegment`) - matching the protocol's
    *    `startVersion <= cutOffCheckpoint.version` rule, and
    *  - it is older than `fileCutOffTime`.
    *
-   * The compaction-file side channel is only fully populated once the returned iterator has been
-   * fully consumed, because consuming the [[BufferingLogDeletionIterator]] drains the shared
-   * listing. The `metadataCleanupAllowed` validation path, which does not consume it fully, simply
-   * leaves `onExpiredCompactionFile` at its default no-op.
+   * Expired compaction files are peeled off this same listing as it is consumed by the returned
+   * [[BufferingLogDeletionIterator]] (reported via `onExpiredCompactionFile`), which avoids a
+   * second listing. This peeling is best-effort: the iterator may stop pulling from the listing
+   * early when it reaches a non-expired segment before a checkpoint, in which case any compaction
+   * files sorting after that point are not seen in this round. That is safe and self-healing -
+   * compaction files are derived/optional, a file with `startVersion <= checkpointVersion` is
+   * already subsumed by the checkpoint and is never selected by readers (see
+   * `useCompactedDeltasForLogSegment`), and it is collected by a later cleanup round once the
+   * retention cutoff advances past the blocking segment. Commit/checkpoint/checksum retention is
+   * identical either way (those files are not affected by the peeling). The
+   * `metadataCleanupAllowed` validation path passes the default no-op callback.
    */
   private def listExpiredDeltaLogs(
       fileCutOffTime: Long,

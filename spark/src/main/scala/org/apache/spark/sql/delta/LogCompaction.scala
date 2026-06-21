@@ -217,6 +217,13 @@ object LogCompaction extends DeltaLogging {
    * `[startVersion, endVersion]` as seen by `snapshot`'s log segment. Used to bound the driver
    * memory consumed by reconciling the window. The sizes come from the already-listed
    * [[org.apache.hadoop.fs.FileStatus]] entries, so this adds no extra file-system calls.
+   *
+   * Best-effort: this assumes `snapshot.logSegment` covers `[startVersion, endVersion]`, which
+   * holds on the post-commit-hook path (the window is always entirely after the checkpoint and is
+   * represented by individual commit files in the segment). If called directly with a snapshot
+   * whose segment does not cover the range, in-range entries may be missing and the result will
+   * under-count (possibly `0`) - so the size guard fails open (compaction proceeds) rather than
+   * ever wrongly tripping.
    */
   private def windowCommitSizeBytes(
       snapshot: Snapshot,
