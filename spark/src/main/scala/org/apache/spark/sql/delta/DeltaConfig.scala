@@ -479,7 +479,7 @@ trait DeltaConfigsBase extends DeltaLogging {
   /** How often to checkpoint the delta log. */
   val CHECKPOINT_INTERVAL = buildConfig[Int](
     "checkpointInterval",
-    "20",
+    "10",
     _.toInt,
     _ > 0,
     "needs to be a positive integer.")
@@ -490,11 +490,11 @@ trait DeltaConfigsBase extends DeltaLogging {
    * (`deltaLog.minorCompaction.useForWrites`). A compaction is attempted after a commit whose
    * version is a multiple of this interval. For the produced files to be non-overlapping and usable
    * by readers, the checkpoint interval ([[CHECKPOINT_INTERVAL]]) should be a multiple of (and
-   * larger than) this value.
+   * larger than) this value (e.g. the defaults: checkpoint every 10 commits, compaction every 5).
    */
   val LOG_COMPACTION_INTERVAL = buildConfig[Int](
     "logCompactionInterval",
-    "10",
+    "5",
     _.toInt,
     _ >= 2,
     "needs to be an integer >= 2.")

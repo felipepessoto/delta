@@ -47,11 +47,11 @@ trait DeltaRetentionSuiteBase extends QueryTest
   protected override def sparkConf: SparkConf = super.sparkConf
     // Disable the log cleanup because it runs asynchronously and causes test flakiness
     .set("spark.databricks.delta.properties.defaults.enableExpiredLogCleanup", "false")
-    // These tests were written assuming a checkpoint is auto-created every 10 commits. Pin the
-    // checkpoint interval to 10 so they are unaffected by the default checkpoint interval (which is
-    // larger). This also keeps the log-compaction post-commit hook inert here (compaction interval
-    // == checkpoint interval), so it does not interfere with the precise log assertions.
-    .set(DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey, "10")
+    // The log-compaction post-commit hook is enabled by default and, with the default compaction
+    // interval smaller than the checkpoint interval, would create compaction files that interfere
+    // with these tests' precise log-file assertions. Disable it here; the compaction-cleanup test
+    // in this suite creates the compaction files it needs explicitly via `LogCompaction.compact`.
+    .set(DeltaSQLConf.DELTALOG_MINOR_COMPACTION_USE_FOR_WRITES.key, "false")
 
   protected def intervalStringToMillis(str: String): Long = {
     DeltaConfigs.getMilliSeconds(

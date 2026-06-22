@@ -186,11 +186,14 @@ trait MetadataCleanup extends DeltaLogging {
    * Instead, to avoid a second full `_delta_log` listing (expensive on object stores), expired
    * compaction files are reported via `onExpiredCompactionFile` for deletion in a separate pass.
    * A compaction file is expired when:
-   *  - its start version is at or before the latest checkpoint version, meaning the checkpoint
-   *    already subsumes the commits it covers so it can no longer be used by readers (see
-   *    `useCompactedDeltasForLogSegment`) - matching the protocol's
-   *    `startVersion <= cutOffCheckpoint.version` rule, and
-   *  - it is older than `fileCutOffTime`.
+   *  - its start version is at or before the latest checkpoint version (read from
+   *    `_last_checkpoint`), so the checkpoint already subsumes the commit range it covers and the
+   *    file is no longer selected when building the latest snapshot (see
+   *    `useCompactedDeltasForLogSegment`), and
+   *  - it is older than `fileCutOffTime` - the age gate that actually preserves any file still
+   *    needed within the retention / time-travel window. (So although the version gate uses the
+   *    latest checkpoint rather than the protocol's retention `cutOffCheckpoint`, the age gate
+   *    ensures no file inside the retention window is ever deleted.)
    *
    * Expired compaction files are peeled off this same listing as it is consumed by the returned
    * [[BufferingLogDeletionIterator]] (reported via `onExpiredCompactionFile`), which avoids a

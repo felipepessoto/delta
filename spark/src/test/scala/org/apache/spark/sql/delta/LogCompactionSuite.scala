@@ -87,15 +87,16 @@ class LogCompactionSuite extends QueryTest
   }
 
   test("log compaction is enabled by default") {
-    // Relies on the default `deltaLog.minorCompaction.useForWrites = true`; a checkpoint interval
-    // larger than the compaction interval is still required for the hook to produce a compaction.
+    // Relies on the default `deltaLog.minorCompaction.useForWrites = true` and the default
+    // compaction interval of 5; a checkpoint interval larger than the compaction interval is still
+    // required for the hook to produce a compaction.
     withSQLConf(
       DeltaConfigs.CHECKPOINT_INTERVAL.defaultTablePropertyKey -> "100") {
       withTempDir { dir =>
         val path = dir.getCanonicalPath
-        val deltaLog = commitUpToVersion(path, 10)
-        assert(compactedRanges(deltaLog) === Seq((1L, 10L)),
-          "compaction should be produced with the default configuration")
+        val deltaLog = commitUpToVersion(path, 5)
+        assert(compactedRanges(deltaLog) === Seq((1L, 5L)),
+          "a compaction over the default interval should be produced with the default config")
       }
     }
   }
