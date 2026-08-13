@@ -145,8 +145,12 @@ trait FileBasedCheckpointProvider
     val checkpointDataframes = allActionsFileIndexesAndSchemas(spark, deltaLog)
       .map { case (index, schema) =>
         val addSchema = schema("add").dataType.asInstanceOf[StructType]
+        val hasStatsParsed = addSchema.exists(_.name == "stats_parsed")
+        val hasJsonStats = addSchema.exists(_.name == "stats")
+        CheckpointProvider.recordStatsSource(
+          deltaLog, version, hasStatsParsed = hasStatsParsed, hasJsonStats = hasJsonStats)
         val (checkpointSchemaToUse, checkpointStatsColToUse) =
-          if (addSchema.exists(_.name == "stats_parsed") && !addSchema.exists(_.name == "stats")) {
+          if (hasStatsParsed && !hasJsonStats) {
             val statsParsedSchema = addSchema("stats_parsed").dataType.asInstanceOf[StructType]
             val checkpointSchemaToUse =
               Action.logSchemaWithAddStatsParsed(addSchema("stats_parsed"))
@@ -182,6 +186,56 @@ object CheckpointProvider extends DeltaLogging {
 
   val MISSING_CHECKPOINT_METADATA_OP_TYPE =
     "delta.checkpointV2.missingCheckpointMetadata"
+
+  /**
+   * Emitted once per checkpoint file index whenever state reconstruction picks a statistics
+   * representation, so that tables which silently lose data skipping (or silently pay for the
+   * stats_parsed -> json round trip) can be detected from usage logs.
+   */
+  val STATS_SOURCE_OP_TYPE = "delta.checkpoint.statsSourceSelected"
+
+  /** Which statistics representation state reconstruction read out of a checkpoint. */
+  object StatsSource {
+    /**
+     * The checkpoint only provided `add.stats_parsed`, so it is json-encoded back into
+     * `add.stats`. Data skipping works, at the cost of a to_json -> from_json round trip.
+     */
+    val StatsParsed = "statsParsed"
+
+    /** The checkpoint only provided the json `add.stats` column, which is used as-is. */
+    val Json = "json"
+
+    /**
+     * The checkpoint provided both columns and the json one won. This is the round trip we would
+     * like to avoid: the typed column is available but downstream code paths only understand json.
+     */
+    val JsonPreferredOverStatsParsed = "jsonPreferredOverStatsParsed"
+
+    /** The checkpoint provided neither column, so the snapshot cannot skip any files. */
+    val NoStats = "noStats"
+  }
+
+  /** Records which stats representation a checkpoint's schema let us use. */
+  private[delta] def recordStatsSource(
+      deltaLog: DeltaLog,
+      checkpointVersion: Long,
+      hasStatsParsed: Boolean,
+      hasJsonStats: Boolean): Unit = {
+    val statsSource = (hasStatsParsed, hasJsonStats) match {
+      case (true, false) => StatsSource.StatsParsed
+      case (false, true) => StatsSource.Json
+      case (true, true) => StatsSource.JsonPreferredOverStatsParsed
+      case (false, false) => StatsSource.NoStats
+    }
+    recordDeltaEvent(
+      deltaLog,
+      opType = STATS_SOURCE_OP_TYPE,
+      data = Map(
+        "checkpointVersion" -> checkpointVersion,
+        "statsSource" -> statsSource,
+        "hasStatsParsed" -> hasStatsParsed,
+        "hasJsonStats" -> hasJsonStats))
+  }
 
   /** Helper method to convert non-empty checkpoint files to DeltaLogFileIndex */
   def checkpointFileIndex(checkpointFiles: Seq[FileStatus]): DeltaLogFileIndex = {
