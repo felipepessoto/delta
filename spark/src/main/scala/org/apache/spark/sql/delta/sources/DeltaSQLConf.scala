@@ -243,10 +243,11 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
     buildConf("snapshot.preferParsedStats.enabled")
       .internal()
       .doc("When enabled, a checkpoint that carries file statistics both as json and as a typed " +
-        "struct hands the typed ones to data skipping, which then parses nothing. The json " +
-        "statistics are still read and handed to the consumers that require them, so no " +
-        "representation is ever converted. Has no effect unless " +
-        "spark.databricks.delta.snapshot.parsedStatsPassthrough.enabled is also set.")
+        "struct reads the typed column and leaves the json one unread, which lets Spark prune " +
+        "the (much larger) json blob from the parquet scan. The json form is reconstructed for " +
+        "the consumers that require it, unless " +
+        "spark.databricks.delta.snapshot.parsedStatsPassthrough.enabled also lets the typed " +
+        "statistics reach data skipping directly.")
       .booleanConf
       .createWithDefault(false)
 

@@ -162,11 +162,8 @@ trait FileBasedCheckpointProvider
         val hasJsonStats = addSchema.exists(_.name == "stats")
 
         // A checkpoint that only offers typed statistics has always been read that way. One that
-        // offers both is only read that way on request, because doing so is a pessimization
-        // unless the typed statistics can travel to their consumer without being json encoded on
-        // the way.
-        val canUseStatsParsed =
-          hasStatsParsed && (!hasJsonStats || (preferParsedStats && parsedStatsSchemaOpt.isDefined))
+        // offers both is only read that way on request.
+        val canUseStatsParsed = hasStatsParsed && (!hasJsonStats || preferParsedStats)
 
         // Typed statistics also have to be reinterpretable as the schema the caller expects,
         // otherwise we would be handing data skipping bounds it cannot trust.
@@ -187,12 +184,11 @@ trait FileBasedCheckpointProvider
           version,
           hasStatsParsed = hasStatsParsed,
           hasJsonStats = hasJsonStats,
-          usedStatsParsed = reconciledStatsParsedColOpt.isDefined)
+          usedStatsParsed = canUseStatsParsed)
 
-        // Read the typed column when we are either going to hand it on directly, or have to json
-        // encode it because it is the only representation this checkpoint has.
-        val readStatsParsed = canUseStatsParsed && !hasJsonStats ||
-          reconciledStatsParsedColOpt.isDefined
+        // Read the typed column whenever we are going to use it, either by handing it on directly
+        // or by json encoding it.
+        val readStatsParsed = canUseStatsParsed
         val (checkpointSchemaToUse, checkpointStatsColToUse) =
           if (readStatsParsed) {
             val statsParsedSchema = addSchema("stats_parsed").dataType.asInstanceOf[StructType]

@@ -467,33 +467,46 @@ class DeltaCheckpointStatsSourceSuite
   }
 
   test("preferring parsed stats agrees with the json path on the stats themselves") {
-    def stats(prefer: Boolean): Seq[Row] = {
-      var result: Seq[Row] = Seq.empty
-      withSQLConf(
-          DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> prefer.toString,
-          DeltaSQLConf.DELTA_SNAPSHOT_PREFER_PARSED_STATS_ENABLED.key -> prefer.toString) {
-        withCheckpointedTable(writeStatsAsJson = true, writeStatsAsStruct = true) { (deltaLog, _) =>
-          result = deltaLog.update().withStats.select(col("stats")).collect().toSeq
+    Seq(false, true).foreach { passthrough =>
+      def stats(prefer: Boolean): Seq[Row] = {
+        var result: Seq[Row] = Seq.empty
+        withSQLConf(
+            DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key ->
+              (prefer && passthrough).toString,
+            DeltaSQLConf.DELTA_SNAPSHOT_PREFER_PARSED_STATS_ENABLED.key -> prefer.toString) {
+          withCheckpointedTable(writeStatsAsJson = true, writeStatsAsStruct = true) {
+            (deltaLog, _) =>
+              result = deltaLog.update().withStats.select(col("stats")).collect().toSeq
+          }
         }
+        result.sortBy(_.toString)
       }
-      result.sortBy(_.toString)
+      assert(stats(prefer = true) === stats(prefer = false),
+        "Preferring the typed statistics changed what data skipping sees " +
+          s"(passthrough=$passthrough)")
     }
-    assert(stats(prefer = true) === stats(prefer = false),
-      "Preferring the typed statistics changed what data skipping sees")
   }
 
-  test("preferring parsed stats has no effect without the passthrough") {
-    // On its own the preference would be a pessimization, since the typed statistics would have to
-    // be json encoded for consumers that only understand json.
+  test("preferring parsed stats works without the passthrough") {
+    // Preferring the typed column does not require carrying it through log replay: json encoding
+    // it at read time still avoids reading the (much larger) json blob out of the checkpoint,
+    // which Spark then prunes from the parquet scan.
     withSQLConf(
         DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> "false",
         DeltaSQLConf.DELTA_SNAPSHOT_PREFER_PARSED_STATS_ENABLED.key -> "true") {
-      withCheckpointedTable(writeStatsAsJson = true, writeStatsAsStruct = true) { (deltaLog, _) =>
-        val statsSources = collectStatsSources {
-          deltaLog.update().stateDF.collect()
-        }
-        assert(statsSources.forall(_ === CheckpointProvider.StatsSource
-          .JsonPreferredOverStatsParsed))
+      withCheckpointedTable(writeStatsAsJson = true, writeStatsAsStruct = true) {
+        (deltaLog, path) =>
+          val statsSources = collectStatsSources {
+            deltaLog.update().stateDF.collect()
+          }
+          assert(statsSources.forall(_ === CheckpointProvider.StatsSource
+            .StatsParsedPreferredOverJson))
+          assert(filesRead(spark, deltaLog, "id = 25", checkEmptyUnusedFilters = true) === 1)
+          checkAnswer(
+            spark.read.format("delta").load(path).where("id = 25").select("id"),
+            Row(25L))
+          // The json statistics every other consumer needs are still there.
+          assert(deltaLog.update().allFiles.collect().forall(_.numLogicalRecords.contains(10L)))
       }
     }
   }
