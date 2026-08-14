@@ -119,10 +119,14 @@ class DeltaCheckpointStatsSourceSuite
       writeStatsAsStruct: Boolean): Row = {
     var result: Row = null
     withTempDir { dir =>
-      df.write.format("delta").save(dir.getCanonicalPath)
+      // One file, so that the single row of statistics compared by the callers is well defined
+      // rather than whichever file happens to come back first.
+      df.repartition(1).write.format("delta").save(dir.getCanonicalPath)
       val deltaLog = DeltaLog.forTable(spark, dir)
       checkpointWithStatsProperties(deltaLog, writeStatsAsJson, writeStatsAsStruct)
-      result = DeltaLog.forTable(spark, dir).update().withStats.select("stats").head()
+      val stats = DeltaLog.forTable(spark, dir).update().withStats.select("stats").collect()
+      assert(stats.length === 1, s"Expected exactly one file, got ${stats.length}")
+      result = stats.head
     }
     result
   }
