@@ -499,13 +499,23 @@ class Snapshot(
   private def stateDFWithJsonStats: DataFrame = {
     val df = stateDF
     if (!df.columns.contains(ADD_STATS_PARSED_TO_USE_COL_NAME)) return df
+    val parsedStatsCol = col(ADD_STATS_PARSED_TO_USE_COL_NAME)
+    // Variant statistics are real variants in the typed column but Z85 encoded strings in json,
+    // so they have to be re-encoded on the way back, or the json would not match the log format.
+    val jsonEncodableStatsCol =
+      if (parsedStatsPassthroughSchemaOpt.exists(
+          SchemaUtils.checkForVariantTypeColumnsRecursively)) {
+        Column(EncodeNestedVariantAsZ85String(parsedStatsCol.expr))
+      } else {
+        parsedStatsCol
+      }
     // `withField` on a null struct evaluates to null, so files without an add action are
     // unaffected, and `to_json` of null statistics stays null.
     df.withColumn(
       "add",
       col("add").withField(
         "stats",
-        coalesce(col("add.stats"), to_json(col(ADD_STATS_PARSED_TO_USE_COL_NAME)))))
+        coalesce(col("add.stats"), to_json(jsonEncodableStatsCol))))
   }
 
   private[delta] def allFilesViaStateReconstruction: Dataset[AddFile] = {
@@ -757,10 +767,7 @@ class Snapshot(
     Option.when(
       spark.sessionState.conf
         .getConf(DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED) &&
-      statsSchema.nonEmpty &&
-      // Variant statistics travel as Z85 encoded strings in json and as real variants in a struct,
-      // so they need a conversion of their own. Leave them on the json path for now.
-      !SchemaUtils.checkForVariantTypeColumnsRecursively(statsSchema))(statsSchema)
+      statsSchema.nonEmpty)(statsSchema)
   }
 
   /**

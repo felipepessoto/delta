@@ -16,6 +16,7 @@
 
 package org.apache.spark.sql.delta
 
+import org.apache.spark.sql.delta.schema.SchemaUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.stats.DataSkippingDeltaTestsUtils
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
@@ -24,6 +25,7 @@ import org.apache.spark.sql.delta.util.JsonUtils
 
 import org.apache.spark.sql.{Column, DataFrame, QueryTest, Row}
 import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructType}
 
@@ -489,6 +491,57 @@ class DeltaCheckpointStatsSourceSuite
         assert(statsSources.forall(_ === CheckpointProvider.StatsSource
           .JsonPreferredOverStatsParsed))
       }
+    }
+  }
+
+  test("variant statistics survive the typed path in both representations") {
+    // Variant statistics are Z85 encoded strings in json but real variants in a struct, so the
+    // typed path has to re-encode them on the way back to json. Getting that wrong would write a
+    // corrupt `stats` column into the next checkpoint, so compare against the json path directly.
+    withSQLConf(
+        "spark.sql.variant.writeShredding.enabled" -> "true",
+        SQLConf.VARIANT_ALLOW_READING_SHREDDED.key -> "true",
+        DeltaSQLConf.COLLECT_VARIANT_DATA_SKIPPING_STATS.key -> "true",
+        DeltaSQLConf.DELTA_STATS_LIMIT_PER_VARIANT.key -> "10") {
+      def jsonStatsOfVariantTable(passthrough: Boolean, asStruct: Boolean): Seq[String] = {
+        var result: Seq[String] = Seq.empty
+        val passthroughConf =
+          DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> passthrough.toString
+        withSQLConf(passthroughConf) {
+          withTempDir { dir =>
+            val path = dir.getCanonicalPath
+            spark.sql(
+              "SELECT id, parse_json(concat('{\"k\": ', id, '}')) AS v FROM range(0, 10)")
+              .repartition(1)
+              .write.format("delta")
+              .option("delta.enableVariantShredding", "true")
+              .save(path)
+            val deltaLog = DeltaLog.forTable(spark, dir)
+            checkpointWithStatsProperties(
+              deltaLog,
+              writeStatsAsJson = !asStruct,
+              writeStatsAsStruct = asStruct)
+            val refreshed = DeltaLog.forTable(spark, dir)
+            val snapshot = refreshed.update()
+            // Guard against this test quietly becoming vacuous: the Z85 re-encoding only matters
+            // if variant columns really made it into the stats schema.
+            assert(
+              SchemaUtils.checkForVariantTypeColumnsRecursively(snapshot.statsSchema),
+              s"Expected variant statistics, got ${snapshot.statsSchema.treeString}")
+            // Correct results still come back.
+            checkAnswer(
+              spark.read.format("delta").load(path).where("id = 5").select("id"),
+              Row(5L))
+            result = snapshot.allFiles.collect().map(_.stats).toSeq
+          }
+        }
+        result.sorted
+      }
+
+      val viaJson = jsonStatsOfVariantTable(passthrough = false, asStruct = false)
+      assert(viaJson.nonEmpty && viaJson.forall(s => s != null && s.nonEmpty))
+      assert(jsonStatsOfVariantTable(passthrough = true, asStruct = true) === viaJson,
+        "Variant statistics carried typed do not round trip back to the same json")
     }
   }
 
