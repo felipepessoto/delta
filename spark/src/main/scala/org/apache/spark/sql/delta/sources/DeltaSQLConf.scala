@@ -219,6 +219,16 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .stringConf
       .createWithDefault("MEMORY_AND_DISK_SER")
 
+  val DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED =
+    buildConf("snapshot.parsedStatsPassthrough.enabled")
+      .internal()
+      .doc("When enabled, state reconstruction carries the typed statistics of a checkpoint " +
+        "that provides `add.stats_parsed` through log replay as a struct, instead of json " +
+        "encoding them back into `add.stats`. Data skipping then reads the typed statistics " +
+        "directly, and the json form is only materialized for the consumers that require it.")
+      .booleanConf
+      .createWithDefault(false)
+
   val DELTA_SNAPSHOT_LOGGING_MAX_FILES_THRESHOLD =
     buildConf("snapshot.logging.maxFilesThreshold")
       .internal()

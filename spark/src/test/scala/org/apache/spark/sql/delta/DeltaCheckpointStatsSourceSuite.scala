@@ -16,14 +16,16 @@
 
 package org.apache.spark.sql.delta
 
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.stats.DataSkippingDeltaTestsUtils
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import org.apache.spark.sql.delta.test.DeltaTestImplicits._
 import org.apache.spark.sql.delta.util.JsonUtils
 
-import org.apache.spark.sql.{DataFrame, QueryTest, Row}
+import org.apache.spark.sql.{Column, DataFrame, QueryTest, Row}
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructType}
 
 /**
  * Tests for how state reconstruction picks between a checkpoint's json `add.stats` column and its
@@ -282,6 +284,187 @@ class DeltaCheckpointStatsSourceSuite
           spark.read.format("delta").load(path).where("id = 25").select("id"),
           Row(25L))
     }
+  }
+
+  // Same matrix again, but with state reconstruction carrying typed statistics through log replay
+  // instead of json encoding them. Results and skipping must be identical to the json path.
+  Seq(
+    (true, false),
+    (false, true),
+    (true, true)
+  ).foreach { case (asJson, asStruct) =>
+    test("parsed stats passthrough preserves skipping: " +
+        s"writeStatsAsJson=$asJson, writeStatsAsStruct=$asStruct") {
+      withSQLConf(
+          DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> "true") {
+        withCheckpointedTable(asJson, asStruct) { (deltaLog, path) =>
+          checkAnswer(
+            spark.read.format("delta").load(path).where("id = 25").select("id"),
+            Row(25L))
+          assert(spark.read.format("delta").load(path).count() === numFiles * 10)
+          assert(filesRead(spark, deltaLog, "id = 25", checkEmptyUnusedFilters = true) === 1)
+          // Consumers that need json statistics (numRecords, tightBounds, ...) must still get
+          // them, whichever representation the checkpoint provided.
+          assert(deltaLog.update().allFiles.collect().forall(_.numLogicalRecords.contains(10L)))
+        }
+      }
+    }
+  }
+
+  test("parsed stats passthrough agrees with the json path on the stats themselves") {
+    def statsFor(passthrough: Boolean, asJson: Boolean, asStruct: Boolean): Seq[Row] = {
+      var result: Seq[Row] = Seq.empty
+      val passthroughConf =
+        DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> passthrough.toString
+      withSQLConf(passthroughConf) {
+        withCheckpointedTable(asJson, asStruct) { (deltaLog, _) =>
+          result = deltaLog.update().withStats.select(col("stats")).collect().toSeq
+        }
+      }
+      result.sortBy(_.toString)
+    }
+
+    // Whether the statistics travelled as a struct or as json, data skipping must see the same
+    // values.
+    val baseline = statsFor(passthrough = false, asJson = true, asStruct = false)
+    assert(baseline.length === numFiles)
+    Seq((true, false), (false, true), (true, true)).foreach { case (asJson, asStruct) =>
+      assert(statsFor(passthrough = true, asJson = asJson, asStruct = asStruct) === baseline,
+        s"Parsed stats passthrough changed the statistics for " +
+          s"writeStatsAsJson=$asJson, writeStatsAsStruct=$asStruct")
+    }
+  }
+
+  test("parsed stats passthrough handles a checkpoint whose stats schema predates the table") {
+    withSQLConf(DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> "true") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        writeFilesWithDisjointRanges(path)
+        val deltaLog = DeltaLog.forTable(spark, dir)
+        checkpointWithStatsProperties(
+          deltaLog, writeStatsAsJson = false, writeStatsAsStruct = true)
+
+        // The checkpoint's stats_parsed schema no longer matches the table's stats schema, so the
+        // extra field has to be null-filled rather than breaking the read.
+        sql(s"ALTER TABLE delta.`$path` ADD COLUMN (extra STRING)")
+        DeltaLog.clearCache()
+
+        val refreshed = DeltaLog.forTable(spark, dir)
+        assert(filesRead(spark, refreshed, "id = 25", checkEmptyUnusedFilters = true) === 1)
+        checkAnswer(
+          spark.read.format("delta").load(path).where("id = 25").select("id", "extra"),
+          Row(25L, null))
+      }
+    }
+  }
+
+  test("a checkpoint written from typed state keeps its statistics") {
+    // Checkpoint writing reads `add.stats` off the state, so a state carrying typed statistics has
+    // to materialize the json form for it. Otherwise the next checkpoint silently loses all stats.
+    withSQLConf(DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> "true") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        writeFilesWithDisjointRanges(path)
+        val deltaLog = DeltaLog.forTable(spark, dir)
+        checkpointWithStatsProperties(
+          deltaLog, writeStatsAsJson = false, writeStatsAsStruct = true)
+
+        // Re-checkpoint from the typed state, this time asking for json statistics as well.
+        val refreshed = DeltaLog.forTable(spark, dir)
+        refreshed.update()
+        checkpointWithStatsProperties(
+          refreshed, writeStatsAsJson = true, writeStatsAsStruct = true)
+
+        val reread = DeltaLog.forTable(spark, dir)
+        assert(reread.update().allFiles.collect().forall(_.stats != null),
+          "The checkpoint written from typed state lost its json statistics")
+        assert(filesRead(spark, reread, "id = 25", checkEmptyUnusedFilters = true) === 1)
+      }
+    }
+  }
+
+  test("parsed stats passthrough is skipped for tables without stats") {
+    // An empty stats schema has no typed column to carry, so the state must stay unchanged.
+    withSQLConf(DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> "true") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        writeFilesWithDisjointRanges(path)
+        sql(s"ALTER TABLE delta.`$path` SET TBLPROPERTIES " +
+          s"('delta.dataSkippingNumIndexedCols' = '0')")
+        val deltaLog = DeltaLog.forTable(spark, dir)
+        checkpointWithStatsProperties(
+          deltaLog, writeStatsAsJson = false, writeStatsAsStruct = true)
+
+        checkAnswer(
+          spark.read.format("delta").load(path).where("id = 25").select("id"),
+          Row(25L))
+        assert(spark.read.format("delta").load(path).count() === numFiles * 10)
+      }
+    }
+  }
+
+  // Reconciling a checkpoint's stats_parsed schema with the snapshot's stats schema has to
+  // reproduce what from_json does implicitly on the json path, and refuse anything it cannot
+  // represent faithfully. These cases are what stands between a schema change and wrong bounds.
+  private def reconcile(source: StructType, target: StructType): Option[Column] =
+    CheckpointProvider.reconcileParsedStatsSchema(col("stats_parsed"), source, target)
+
+  test("stats schema reconciliation: identical schemas") {
+    val schema = new StructType().add("numRecords", LongType)
+      .add("minValues", new StructType().add("id", LongType))
+    assert(reconcile(schema, schema).isDefined)
+  }
+
+  test("stats schema reconciliation: field the checkpoint does not have is null filled") {
+    val source = new StructType().add("numRecords", LongType)
+    val target = new StructType().add("numRecords", LongType)
+      .add("minValues", new StructType().add("added", StringType))
+    assert(reconcile(source, target).isDefined)
+  }
+
+  test("stats schema reconciliation: field only the checkpoint has is dropped") {
+    val source = new StructType().add("numRecords", LongType)
+      .add("minValues", new StructType().add("id", LongType).add("dropped", StringType))
+    val target = new StructType().add("numRecords", LongType)
+      .add("minValues", new StructType().add("id", LongType))
+    assert(reconcile(source, target).isDefined)
+  }
+
+  test("stats schema reconciliation: widened types are up-cast") {
+    val source = new StructType().add("minValues", new StructType().add("id", IntegerType))
+    val target = new StructType().add("minValues", new StructType().add("id", LongType))
+    assert(reconcile(source, target).isDefined)
+  }
+
+  test("stats schema reconciliation: narrowing types fall back") {
+    // Reading a long minimum as an int would silently corrupt the bounds.
+    val source = new StructType().add("minValues", new StructType().add("id", LongType))
+    val target = new StructType().add("minValues", new StructType().add("id", IntegerType))
+    assert(reconcile(source, target).isEmpty)
+  }
+
+  test("stats schema reconciliation: a field that stopped being a struct falls back") {
+    val source = new StructType()
+      .add("minValues", new StructType().add("c", new StructType().add("x", LongType)))
+    val target = new StructType().add("minValues", new StructType().add("c", LongType))
+    assert(reconcile(source, target).isEmpty)
+  }
+
+  test("stats schema reconciliation: a field that became a struct falls back") {
+    val source = new StructType().add("minValues", new StructType().add("c", LongType))
+    val target = new StructType()
+      .add("minValues", new StructType().add("c", new StructType().add("x", LongType)))
+    assert(reconcile(source, target).isEmpty)
+  }
+
+  test("stats schema reconciliation: an unreconcilable nested field fails the whole struct") {
+    // Falling back wholesale is the point: a partially reinterpreted struct would mix trustworthy
+    // and untrustworthy bounds with no way for the caller to tell them apart.
+    val source = new StructType().add("numRecords", LongType)
+      .add("minValues", new StructType().add("ok", LongType).add("bad", LongType))
+    val target = new StructType().add("numRecords", LongType)
+      .add("minValues", new StructType().add("ok", LongType).add("bad", IntegerType))
+    assert(reconcile(source, target).isEmpty)
   }
 }
 

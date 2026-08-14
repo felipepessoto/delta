@@ -26,6 +26,7 @@ import scala.util.Try
 import com.databricks.spark.util.TagDefinition
 import org.apache.spark.sql.delta.actions._
 import org.apache.spark.sql.delta.actions.Action.logSchema
+import org.apache.spark.sql.delta.actions.InMemoryLogReplay.{UniqueAddFileTuple, UniqueFileActionTuple}
 import org.apache.spark.sql.delta.amt.{AMTCheckpointProvider, AMTUsageLogs}
 import org.apache.spark.sql.delta.ClassicColumnConversions._
 import org.apache.spark.sql.delta.coordinatedcommits.{CatalogOwnedTableUtils, CommitCoordinatorClient, CommitCoordinatorProvider, CoordinatedCommitsUsageLogs, CoordinatedCommitsUtils, TableCommitCoordinatorClient}
@@ -51,6 +52,7 @@ import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.spark.internal.{MDC, MessageWithContext}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
+import org.apache.spark.sql.catalyst.encoders.RowEncoder
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat, ParquetToSparkSchemaConverter}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.StructType
@@ -483,11 +485,46 @@ class Snapshot(
   /** The current set of actions in this [[Snapshot]] as a typed Dataset. */
   def stateDS: Dataset[SingleAction] =
     recordFrameProfile("Delta", "stateDS") {
-    cachedState.getDS
+    // State reconstruction may carry typed statistics in an extra column, which the SingleAction
+    // schema has no room for. Materialize the json form the actions themselves declare, and
+    // project the extra column away.
+    stateDFWithJsonStats.select(Action.logSchema.fieldNames.toSeq.map(col): _*).as[SingleAction]
+  }
+
+  /**
+   * [[stateDF]], but with `add.stats` guaranteed to hold the json statistics even for files whose
+   * statistics were carried through state reconstruction in typed form. This is what every
+   * consumer of [[AddFile.stats]] needs; only data skipping can use the typed column directly.
+   */
+  private def stateDFWithJsonStats: DataFrame = {
+    val df = stateDF
+    if (!df.columns.contains(ADD_STATS_PARSED_TO_USE_COL_NAME)) return df
+    // `withField` on a null struct evaluates to null, so files without an add action are
+    // unaffected, and `to_json` of null statistics stays null.
+    df.withColumn(
+      "add",
+      col("add").withField(
+        "stats",
+        coalesce(col("add.stats"), to_json(col(ADD_STATS_PARSED_TO_USE_COL_NAME)))))
   }
 
   private[delta] def allFilesViaStateReconstruction: Dataset[AddFile] = {
-    stateDS.where("add IS NOT NULL").select(col("add").as[AddFile])
+    stateDFWithJsonStats.where("add IS NOT NULL").select(col("add").as[AddFile])
+  }
+
+  /**
+   * Hands data skipping the typed statistics directly when state reconstruction carried them,
+   * parsing json only for the files that could not be carried typed (delta commits on top of a
+   * struct checkpoint, or checkpoints that only had json statistics to offer).
+   */
+  override protected def allFilesWithTypedStatsOpt(jsonStats: Column): Option[DataFrame] = {
+    val df = stateDF
+    Option.when(df.columns.contains(ADD_STATS_PARSED_TO_USE_COL_NAME)) {
+      df.where("add IS NOT NULL")
+        .select(col("add.*"), col(ADD_STATS_PARSED_TO_USE_COL_NAME))
+        .withColumn("stats", coalesce(col(ADD_STATS_PARSED_TO_USE_COL_NAME), jsonStats))
+        .drop(ADD_STATS_PARSED_TO_USE_COL_NAME)
+    }
   }
 
   // Here we need to bypass the ACL checks for SELECT anonymous function permissions.
@@ -595,7 +632,7 @@ class Snapshot(
   // Reconstruct the state by applying deltas in order to the checkpoint.
   // We partition by path as it is likely the bulk of the data is add/remove.
   // Non-path based actions will be collocated to a single partition.
-  protected def stateReconstruction: Dataset[SingleAction] = {
+  protected def stateReconstruction: DataFrame = {
     recordFrameProfile("Delta", "snapshot.stateReconstruction") {
       // for serializability
       val localMinFileRetentionTimestamp = minFileRetentionTimestamp
@@ -612,7 +649,7 @@ class Snapshot(
       // actions are presented to InMemoryLogReplay in the ascending version order it expects.
       val ADD_PATH_CANONICAL_COL_NAME = "add_path_canonical"
       val REMOVE_PATH_CANONICAL_COL_NAME = "remove_path_canonical"
-      loadActions
+      val replayInput = loadActions
         .withColumn(ADD_PATH_CANONICAL_COL_NAME, when(
           col("add.path").isNotNull, canonicalPath(col("add.path"))))
         .withColumn(REMOVE_PATH_CANONICAL_COL_NAME, when(
@@ -641,16 +678,79 @@ class Snapshot(
         .withColumn("remove", when(
           col("remove.path").isNotNull,
           col("remove").withField("path", col(REMOVE_PATH_CANONICAL_COL_NAME))))
-        .as[SingleAction]
-        .mapPartitions { iter =>
-          val state: LogReplay =
-            new InMemoryLogReplay(
-              Some(localMinFileRetentionTimestamp),
-              localMinSetTransactionRetentionTimestamp)
-          state.append(0, iter.map(_.unwrap))
-          state.checkpoint.map(_.wrap)
-        }
+
+      def newLogReplay: LogReplay = new InMemoryLogReplay(
+        Some(localMinFileRetentionTimestamp),
+        localMinSetTransactionRetentionTimestamp)
+
+      parsedStatsPassthroughSchemaOpt match {
+        case None =>
+          replayInput
+            .as[SingleAction]
+            .mapPartitions { iter =>
+              val state = newLogReplay
+              state.append(0, iter.map(_.unwrap))
+              state.checkpoint.map(_.wrap)
+            }
+            .toDF()
+
+        case Some(parsedStatsSchema) =>
+          // Carry the typed statistics alongside each action across the replay boundary. The
+          // replay itself is unchanged: we record each file's typed statistics as the actions
+          // stream past, in the same "last write wins" order the replay uses, and re-attach them
+          // to whichever files survive. Note that files are identified the way log replay
+          // identifies them, by (path, deletion vector), not by path alone.
+          implicit val replayEncoder: Encoder[(SingleAction, Row)] =
+            Encoders.tuple(singleActionEncoder, RowEncoder.encoderFor(parsedStatsSchema))
+
+          replayInput
+            .select(
+              struct(Action.logSchema.fieldNames.toSeq.map(col): _*).as("_1"),
+              col(ADD_STATS_PARSED_TO_USE_COL_NAME).as("_2"))
+            .as[(SingleAction, Row)]
+            .mapPartitions { iter =>
+              val state = newLogReplay
+              val parsedStatsByFile =
+                new scala.collection.mutable.HashMap[UniqueFileActionTuple, Row]()
+              val actions = iter.map { case (singleAction, parsedStats) =>
+                val action = singleAction.unwrap
+                action match {
+                  case add: AddFile if parsedStats != null =>
+                    parsedStatsByFile(add.toUniqueFileActionTuple) = parsedStats
+                  case _ => // Only AddFile actions carry statistics.
+                }
+                action
+              }
+              state.append(0, actions)
+              state.checkpoint.map { action =>
+                val parsedStats = action match {
+                  case add: AddFile =>
+                    parsedStatsByFile.getOrElse(add.toUniqueFileActionTuple, null)
+                  case _ => null
+                }
+                (action.wrap, parsedStats)
+              }
+            }
+            .select(col("_1.*"), col("_2").as(ADD_STATS_PARSED_TO_USE_COL_NAME))
+      }
     }
+  }
+
+  /**
+   * The stats schema to carry through state reconstruction in typed form, or None when statistics
+   * should keep flowing through the json `add.stats` column only (the default).
+   *
+   * Fixed once per snapshot: state reconstruction and its consumers must agree on whether the
+   * cached state has the extra column, even if the conf changes underneath them.
+   */
+  protected lazy val parsedStatsPassthroughSchemaOpt: Option[StructType] = {
+    Option.when(
+      spark.sessionState.conf
+        .getConf(DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED) &&
+      statsSchema.nonEmpty &&
+      // Variant statistics travel as Z85 encoded strings in json and as real variants in a struct,
+      // so they need a conversion of their own. Leave them on the json path for now.
+      !SchemaUtils.checkForVariantTypeColumnsRecursively(statsSchema))(statsSchema)
   }
 
   /**
@@ -663,21 +763,30 @@ class Snapshot(
    * config settings for delta.checkpoint.writeStatsAsJson and delta.checkpoint.writeStatsAsStruct).
    * When we see a V2 checkpoint without the old stats column, but the stats_parsed column, we
    * json encode the stats_parsed column back as "stats" again. This is a temporary correctness
-   * hack.
+   * hack, avoided when [[parsedStatsPassthroughSchemaOpt]] lets the typed statistics travel in
+   * [[ADD_STATS_PARSED_TO_USE_COL_NAME]] instead.
    */
   protected def loadActions: DataFrame = {
     // The checkpoint contributes its actions as a single DataFrame, already carrying
     // COMMIT_VERSION_COLUMN and ADD_STATS_TO_USE_COL_NAME and internally normalizing add.stats /
     // add.stats_parsed. The physical checkpoint layout stays behind
     // `loadActionsForStateReconstruction`. Meanwhile, JSON deltas always map add.stats to
-    // add_stats_to_use.
+    // add_stats_to_use, and never have typed statistics to contribute.
     val logSchemaToUse = Action.logSchema
     val jsonStatsCol = col("add.stats")
+    val parsedStatsSchemaOpt = parsedStatsPassthroughSchemaOpt
+    def withEmptyParsedStats(df: DataFrame): DataFrame =
+      parsedStatsSchemaOpt.foldLeft(df) { (df, parsedStatsSchema) =>
+        df.withColumn(ADD_STATS_PARSED_TO_USE_COL_NAME, lit(null).cast(parsedStatsSchema))
+      }
     val deltas = deltaFileIndexOpt.map(deltaLog.loadIndex(_, logSchemaToUse))
       .map(_.withColumn(ADD_STATS_TO_USE_COL_NAME, jsonStatsCol))
+      .map(withEmptyParsedStats)
 
-    val checkpointDataframe = checkpointProvider.loadActionsForStateReconstruction(spark, deltaLog)
-    (checkpointDataframe.toSeq ++ deltas).reduceOption(_.union(_)).getOrElse(emptyDF)
+    val checkpointDataframe =
+      checkpointProvider.loadActionsForStateReconstruction(spark, deltaLog, parsedStatsSchemaOpt)
+    (checkpointDataframe.toSeq ++ deltas).reduceOption(_.union(_))
+      .getOrElse(withEmptyParsedStats(emptyDF))
   }
 
   /**
@@ -853,6 +962,14 @@ object Snapshot extends DeltaLogging {
 
   // Used by [[loadActions]] and [[stateReconstruction]]
   val ADD_STATS_TO_USE_COL_NAME = "add_stats_to_use"
+
+  /**
+   * Column carrying a file's statistics in their typed (struct) form through state reconstruction,
+   * for checkpoints that provide `add.stats_parsed`. Null for files whose statistics only exist as
+   * json, and absent entirely unless
+   * [[DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED]] is set.
+   */
+  val ADD_STATS_PARSED_TO_USE_COL_NAME = "add_stats_parsed_to_use"
 
   /**
    * Schema for the protocol/metadata/in-commit-timestamp query fast path. Shared between

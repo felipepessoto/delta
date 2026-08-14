@@ -37,8 +37,9 @@ import org.apache.hadoop.fs.{FileStatus, Path}
 
 import org.apache.spark.sql.{Column, DataFrame, Dataset}
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.functions.{col, lit, to_json}
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.catalyst.expressions.Cast
+import org.apache.spark.sql.functions.{col, lit, struct, to_json}
+import org.apache.spark.sql.types.{StringType, StructField, StructType}
 
 /**
  * Represents basic information about a checkpoint.
@@ -98,9 +99,17 @@ trait CheckpointProvider extends UninitializedCheckpointProvider {
    * checkpoint is empty), already carrying [[COMMIT_VERSION_COLUMN]] and
    * [[Snapshot.ADD_STATS_TO_USE_COL_NAME]] and unioned across all underlying files. Consumers just
    * union this with the delta DataFrames; the physical layout stays behind this method.
+   *
+   * When `parsedStatsSchemaOpt` is set, the result additionally carries
+   * [[Snapshot.ADD_STATS_PARSED_TO_USE_COL_NAME]], typed exactly as the given schema, holding the
+   * statistics of any checkpoint that provides them in typed form. Providers that cannot supply
+   * typed statistics must still emit that column as a typed null, so that all the DataFrames
+   * taking part in the state reconstruction union share one schema.
    */
   def loadActionsForStateReconstruction(
-      spark: SparkSession, deltaLog: DeltaLog): Option[DataFrame]
+      spark: SparkSession,
+      deltaLog: DeltaLog,
+      parsedStatsSchemaOpt: Option[StructType] = None): Option[DataFrame]
 }
 
 /**
@@ -140,7 +149,9 @@ trait FileBasedCheckpointProvider
     spark: SparkSession, deltaLog: DeltaLog): Seq[(DeltaLogFileIndex, StructType)]
 
   override def loadActionsForStateReconstruction(
-      spark: SparkSession, deltaLog: DeltaLog): Option[DataFrame] = {
+      spark: SparkSession,
+      deltaLog: DeltaLog,
+      parsedStatsSchemaOpt: Option[StructType] = None): Option[DataFrame] = {
     val jsonStatsCol = col("add.stats")
     val checkpointDataframes = allActionsFileIndexesAndSchemas(spark, deltaLog)
       .map { case (index, schema) =>
@@ -149,6 +160,25 @@ trait FileBasedCheckpointProvider
         val hasJsonStats = addSchema.exists(_.name == "stats")
         CheckpointProvider.recordStatsSource(
           deltaLog, version, hasStatsParsed = hasStatsParsed, hasJsonStats = hasJsonStats)
+
+        // Typed statistics can only replace the json ones when the caller asked for them, this
+        // checkpoint actually provides them, and its schema can be reconciled with the schema the
+        // caller expects. Note that a checkpoint carrying both representations still reads the
+        // json one, exactly as it did before; preferring the typed column in that case is a
+        // separate, independently gated change.
+        val reconciledStatsParsedColOpt = parsedStatsSchemaOpt.flatMap { targetSchema =>
+          Option.when(hasStatsParsed && !hasJsonStats)(()).flatMap { _ =>
+            val statsParsedSchema = addSchema("stats_parsed").dataType.asInstanceOf[StructType]
+            val reconciled = CheckpointProvider.reconcileParsedStatsSchema(
+              col("add.stats_parsed"), statsParsedSchema, targetSchema)
+            if (reconciled.isEmpty) {
+              CheckpointProvider.recordParsedStatsFallback(
+                deltaLog, version, statsParsedSchema, targetSchema)
+            }
+            reconciled
+          }
+        }
+
         val (checkpointSchemaToUse, checkpointStatsColToUse) =
           if (hasStatsParsed && !hasJsonStats) {
             val statsParsedSchema = addSchema("stats_parsed").dataType.asInstanceOf[StructType]
@@ -163,19 +193,35 @@ trait FileBasedCheckpointProvider
               } else {
                 statsCol
               }
-            (
-              checkpointSchemaToUse,
-              to_json(encodedStatsCol)
-            )
+            // The typed statistics travel in their own column, so there is no need to json encode
+            // them here; the json form is materialized later, and only for the consumers that
+            // still require it.
+            val jsonStatsToUse =
+              if (reconciledStatsParsedColOpt.isDefined) {
+                lit(null).cast(StringType)
+              } else {
+                to_json(encodedStatsCol)
+              }
+            (checkpointSchemaToUse, jsonStatsToUse)
           } else {
             // Normal (JSON-like) schema suffices
             (Action.logSchema, jsonStatsCol)
           }
 
         // For schema compat, make sure to discard add.stats_parsed (if present)
-        deltaLog.loadIndex(index, checkpointSchemaToUse)
+        val df = deltaLog.loadIndex(index, checkpointSchemaToUse)
           .withColumn(COMMIT_VERSION_COLUMN, lit(version))
           .withColumn(Snapshot.ADD_STATS_TO_USE_COL_NAME, checkpointStatsColToUse)
+
+        // Every branch has to contribute an identically typed column, otherwise the union across
+        // file indexes (v2 checkpoints resolve their sidecars separately) cannot resolve.
+        parsedStatsSchemaOpt
+          .map { targetSchema =>
+            df.withColumn(
+              Snapshot.ADD_STATS_PARSED_TO_USE_COL_NAME,
+              reconciledStatsParsedColOpt.getOrElse(lit(null).cast(targetSchema)))
+          }
+          .getOrElse(df)
           .withColumn("add", col("add").dropFields("stats_parsed"))
       }
     checkpointDataframes.reduceOption(_.union(_))
@@ -235,6 +281,70 @@ object CheckpointProvider extends DeltaLogging {
         "statsSource" -> statsSource,
         "hasStatsParsed" -> hasStatsParsed,
         "hasJsonStats" -> hasJsonStats))
+  }
+
+  /**
+   * Emitted when a checkpoint offers typed statistics that cannot be reinterpreted as the schema
+   * the snapshot expects, so we fall back to the json representation. Such tables keep working,
+   * but silently keep paying for the round trip this event exists to make visible.
+   */
+  val STATS_PARSED_FALLBACK_OP_TYPE = "delta.checkpoint.statsParsedFallback"
+
+  /** Records that typed statistics were available but could not be used. */
+  private[delta] def recordParsedStatsFallback(
+      deltaLog: DeltaLog,
+      checkpointVersion: Long,
+      checkpointStatsSchema: StructType,
+      targetStatsSchema: StructType): Unit = {
+    recordDeltaEvent(
+      deltaLog,
+      opType = STATS_PARSED_FALLBACK_OP_TYPE,
+      data = Map(
+        "checkpointVersion" -> checkpointVersion,
+        "checkpointStatsSchema" -> checkpointStatsSchema.json,
+        "targetStatsSchema" -> targetStatsSchema.json))
+  }
+
+  /**
+   * Reinterprets a checkpoint's `stats_parsed` column as `targetSchema`.
+   *
+   * The schema a checkpoint was written with is not necessarily the schema the snapshot reading it
+   * expects: columns may have been added, dropped or renamed, and types may have been widened
+   * since. Reading the json statistics performs this reconciliation implicitly, because `from_json`
+   * matches fields by name, ignores unknown ones and null-fills missing ones; reading the typed
+   * column has to do the same explicitly.
+   *
+   * Fields present in both are taken from the checkpoint (up-cast when the type has been widened),
+   * fields only the target knows about are null-filled, and fields only the checkpoint knows about
+   * are dropped. Returns None when some field cannot be reinterpreted without changing its meaning,
+   * in which case the caller must fall back to the json statistics rather than risk wrong bounds.
+   *
+   * Note that field names here are physical names, so this also covers column mapping.
+   */
+  private[delta] def reconcileParsedStatsSchema(
+      statsParsedCol: Column,
+      sourceSchema: StructType,
+      targetSchema: StructType): Option[Column] = {
+    val projectedFields = targetSchema.fields.map { targetField =>
+      sourceSchema.fields.find(_.name == targetField.name) match {
+        // The checkpoint predates this field, so it has no statistics to offer for it. This is
+        // exactly what from_json would do with a json blob that lacks the field.
+        case None => Some(lit(null).cast(targetField.dataType).as(targetField.name))
+        case Some(sourceField) => (sourceField.dataType, targetField.dataType) match {
+          case (source: StructType, target: StructType) =>
+            reconcileParsedStatsSchema(statsParsedCol.getField(targetField.name), source, target)
+              .map(_.as(targetField.name))
+          case (source, target) if source == target =>
+            Some(statsParsedCol.getField(targetField.name).as(targetField.name))
+          case (source, target) if Cast.canUpCast(source, target) =>
+            Some(statsParsedCol.getField(targetField.name).cast(target).as(targetField.name))
+          // Anything else (a narrowing or otherwise lossy change) would silently corrupt the
+          // bounds data skipping relies on.
+          case _ => None
+        }
+      }
+    }
+    Option.when(projectedFields.forall(_.isDefined))(struct(projectedFields.map(_.get).toSeq: _*))
   }
 
   /** Helper method to convert non-empty checkpoint files to DeltaLogFileIndex */
@@ -524,7 +634,9 @@ object EmptyCheckpointProvider extends CheckpointProvider {
   override def loadProtocolMetadataActions(
     spark: SparkSession, deltaLog: DeltaLog): Option[DataFrame] = None
   override def loadActionsForStateReconstruction(
-    spark: SparkSession, deltaLog: DeltaLog): Option[DataFrame] = None
+    spark: SparkSession,
+    deltaLog: DeltaLog,
+    parsedStatsSchemaOpt: Option[StructType] = None): Option[DataFrame] = None
 }
 
 /** A trait representing a v2 [[UninitializedCheckpointProvider]] */

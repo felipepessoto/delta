@@ -299,8 +299,19 @@ trait DataSkippingReaderBase
     } else {
       parsedStats
     }
-    allFiles.withColumn("stats", decodedStats)
+    // Files whose statistics already reached us typed need no parsing at all; only those that
+    // could only be carried as json (delta commits, json checkpoints) pay for `from_json`.
+    allFilesWithTypedStatsOpt(decodedStats)
+      .getOrElse(allFiles.withColumn("stats", decodedStats))
   }
+
+  /**
+   * All files with a `stats` column holding typed statistics, for readers whose state
+   * reconstruction already carries them typed. `jsonStats` parses the json statistics of the files
+   * that do not have typed ones. None when no file can have typed statistics, in which case the
+   * caller parses json for all of them.
+   */
+  protected def allFilesWithTypedStatsOpt(jsonStats: Column): Option[DataFrame] = None
 
   private lazy val withStatsCache =
     cacheDS(withStatsInternal0, s"Delta Table State with Stats #$version - $redactedPath")

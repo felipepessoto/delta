@@ -107,11 +107,18 @@ final class AMTCheckpointProvider(
   }
 
   override def loadActionsForStateReconstruction(
-      spark: SparkSession, deltaLog: DeltaLog): Option[DataFrame] = {
+      spark: SparkSession,
+      deltaLog: DeltaLog,
+      parsedStatsSchemaOpt: Option[StructType] = None): Option[DataFrame] = {
     val df = allActions(spark, deltaLog).toDF()
       .withColumn(COMMIT_VERSION_COLUMN, lit(version))
       .withColumn(Snapshot.ADD_STATS_TO_USE_COL_NAME, col("add.stats"))
-    Some(df)
+    // Adaptive metadata manifests only carry json statistics, but the column still has to be
+    // present (and identically typed) for the state reconstruction union to resolve.
+    Some(parsedStatsSchemaOpt.foldLeft(df) { (df, parsedStatsSchema) =>
+      df.withColumn(
+        Snapshot.ADD_STATS_PARSED_TO_USE_COL_NAME, lit(null).cast(parsedStatsSchema))
+    })
   }
   /**
    * The full action set of this checkpoint as a distributed [[Dataset]] of [[SingleAction]]: the
