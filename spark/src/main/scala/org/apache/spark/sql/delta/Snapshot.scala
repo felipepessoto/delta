@@ -527,6 +527,16 @@ class Snapshot(
     }
   }
 
+  /**
+   * With typed statistics carried by the state, the files-with-statistics DataFrame is a
+   * projection over the already cached state, so persisting it again would keep a second copy of
+   * every file's statistics in memory for no benefit.
+   */
+  override protected def shouldCacheWithStats: Boolean = {
+    parsedStatsPassthroughSchemaOpt.isEmpty ||
+      !spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_SKIP_CACHE_ENABLED)
+  }
+
   // Here we need to bypass the ACL checks for SELECT anonymous function permissions.
   /** All of the files present in this [[Snapshot]]. */
   def allFiles: Dataset[AddFile] = allFilesViaStateReconstruction

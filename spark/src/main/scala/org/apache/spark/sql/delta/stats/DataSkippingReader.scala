@@ -313,10 +313,20 @@ trait DataSkippingReaderBase
    */
   protected def allFilesWithTypedStatsOpt(jsonStats: Column): Option[DataFrame] = None
 
+  /**
+   * Whether the files-with-statistics DataFrame deserves a persisted cache of its own.
+   *
+   * Parsing the json statistics of every file is expensive enough to be worth caching. Once state
+   * reconstruction carries them typed, though, this is only a projection over the already cached
+   * state, and caching it again would persist every file's statistics a second time.
+   */
+  protected def shouldCacheWithStats: Boolean = true
+
   private lazy val withStatsCache =
     cacheDS(withStatsInternal0, s"Delta Table State with Stats #$version - $redactedPath")
 
-  protected def withStatsInternal: DataFrame = withStatsCache.getDS
+  protected def withStatsInternal: DataFrame =
+    if (shouldCacheWithStats) withStatsCache.getDS else withStatsInternal0
 
   /** All files with the statistics column dropped completely. */
   def withNoStats: DataFrame = allFiles.drop("stats")

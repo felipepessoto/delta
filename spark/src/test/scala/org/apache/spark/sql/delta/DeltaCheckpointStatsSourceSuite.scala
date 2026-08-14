@@ -403,6 +403,36 @@ class DeltaCheckpointStatsSourceSuite
     }
   }
 
+  test("parsed stats passthrough persists the statistics only once") {
+    // Delta persists file statistics twice for any snapshot doing data skipping: once as json in
+    // the state cache, and once as a struct in the data skipping cache. Carrying them typed makes
+    // the second one redundant, which is the largest practical win of the passthrough.
+    def persistedRddCount(passthrough: Boolean): Int = {
+      var count = 0
+      val passthroughConf =
+        DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> passthrough.toString
+      withSQLConf(passthroughConf) {
+        withCheckpointedTable(writeStatsAsJson = false, writeStatsAsStruct = true) {
+          (deltaLog, _) =>
+            spark.sparkContext.getPersistentRDDs.values.foreach(_.unpersist(blocking = true))
+            val snapshot = deltaLog.update()
+            // Materialize both the state and the files-with-statistics view.
+            snapshot.stateDF.collect()
+            snapshot.withStats.collect()
+            count = spark.sparkContext.getPersistentRDDs.size
+        }
+      }
+      count
+    }
+
+    val withoutPassthrough = persistedRddCount(passthrough = false)
+    val withPassthrough = persistedRddCount(passthrough = true)
+    assert(withoutPassthrough === 2,
+      s"Expected the state and the stats to be persisted separately, got $withoutPassthrough")
+    assert(withPassthrough === 1,
+      s"Expected a single persisted copy of the statistics, got $withPassthrough")
+  }
+
   // Reconciling a checkpoint's stats_parsed schema with the snapshot's stats schema has to
   // reproduce what from_json does implicitly on the json path, and refuse anything it cannot
   // represent faithfully. These cases are what stands between a schema change and wrong bounds.

@@ -229,6 +229,16 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(false)
 
+  val DELTA_SNAPSHOT_PARSED_STATS_SKIP_CACHE_ENABLED =
+    buildConf("snapshot.parsedStatsPassthrough.skipStatsCache.enabled")
+      .internal()
+      .doc("When enabled, snapshots whose state already carries typed statistics do not persist " +
+        "a second copy of them for data skipping, since deriving the statistics from the state " +
+        "is then only a projection. Has no effect unless " +
+        "spark.databricks.delta.snapshot.parsedStatsPassthrough.enabled is also set.")
+      .booleanConf
+      .createWithDefault(true)
+
   val DELTA_SNAPSHOT_LOGGING_MAX_FILES_THRESHOLD =
     buildConf("snapshot.logging.maxFilesThreshold")
       .internal()
