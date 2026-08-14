@@ -433,6 +433,65 @@ class DeltaCheckpointStatsSourceSuite
       s"Expected a single persisted copy of the statistics, got $withPassthrough")
   }
 
+  test("preferring parsed stats keeps skipping and converts nothing") {
+    // The common configuration: the checkpoint carries both representations. Data skipping should
+    // read the typed one, while the consumers that need json still get it straight from the
+    // checkpoint, so neither is converted.
+    withSQLConf(
+        DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> "true",
+        DeltaSQLConf.DELTA_SNAPSHOT_PREFER_PARSED_STATS_ENABLED.key -> "true") {
+      withCheckpointedTable(writeStatsAsJson = true, writeStatsAsStruct = true) {
+        (deltaLog, path) =>
+          val statsSources = collectStatsSources {
+            deltaLog.update().stateDF.collect()
+          }
+          assert(statsSources.nonEmpty)
+          assert(statsSources.forall(_ === CheckpointProvider.StatsSource
+            .StatsParsedPreferredOverJson),
+            s"Expected the typed statistics to win, got ${statsSources.mkString(", ")}")
+
+          checkAnswer(
+            spark.read.format("delta").load(path).where("id = 25").select("id"),
+            Row(25L))
+          assert(filesRead(spark, deltaLog, "id = 25", checkEmptyUnusedFilters = true) === 1)
+          // The json statistics are still available to the consumers that need them.
+          assert(deltaLog.update().allFiles.collect().forall(_.numLogicalRecords.contains(10L)))
+      }
+    }
+  }
+
+  test("preferring parsed stats agrees with the json path on the stats themselves") {
+    def stats(prefer: Boolean): Seq[Row] = {
+      var result: Seq[Row] = Seq.empty
+      withSQLConf(
+          DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> prefer.toString,
+          DeltaSQLConf.DELTA_SNAPSHOT_PREFER_PARSED_STATS_ENABLED.key -> prefer.toString) {
+        withCheckpointedTable(writeStatsAsJson = true, writeStatsAsStruct = true) { (deltaLog, _) =>
+          result = deltaLog.update().withStats.select(col("stats")).collect().toSeq
+        }
+      }
+      result.sortBy(_.toString)
+    }
+    assert(stats(prefer = true) === stats(prefer = false),
+      "Preferring the typed statistics changed what data skipping sees")
+  }
+
+  test("preferring parsed stats has no effect without the passthrough") {
+    // On its own the preference would be a pessimization, since the typed statistics would have to
+    // be json encoded for consumers that only understand json.
+    withSQLConf(
+        DeltaSQLConf.DELTA_SNAPSHOT_PARSED_STATS_PASSTHROUGH_ENABLED.key -> "false",
+        DeltaSQLConf.DELTA_SNAPSHOT_PREFER_PARSED_STATS_ENABLED.key -> "true") {
+      withCheckpointedTable(writeStatsAsJson = true, writeStatsAsStruct = true) { (deltaLog, _) =>
+        val statsSources = collectStatsSources {
+          deltaLog.update().stateDF.collect()
+        }
+        assert(statsSources.forall(_ === CheckpointProvider.StatsSource
+          .JsonPreferredOverStatsParsed))
+      }
+    }
+  }
+
   // Reconciling a checkpoint's stats_parsed schema with the snapshot's stats schema has to
   // reproduce what from_json does implicitly on the json path, and refuse anything it cannot
   // represent faithfully. These cases are what stands between a schema change and wrong bounds.

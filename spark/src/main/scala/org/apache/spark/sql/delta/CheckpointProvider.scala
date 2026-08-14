@@ -153,21 +153,25 @@ trait FileBasedCheckpointProvider
       deltaLog: DeltaLog,
       parsedStatsSchemaOpt: Option[StructType] = None): Option[DataFrame] = {
     val jsonStatsCol = col("add.stats")
+    val preferParsedStats =
+      spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_SNAPSHOT_PREFER_PARSED_STATS_ENABLED)
     val checkpointDataframes = allActionsFileIndexesAndSchemas(spark, deltaLog)
       .map { case (index, schema) =>
         val addSchema = schema("add").dataType.asInstanceOf[StructType]
         val hasStatsParsed = addSchema.exists(_.name == "stats_parsed")
         val hasJsonStats = addSchema.exists(_.name == "stats")
-        CheckpointProvider.recordStatsSource(
-          deltaLog, version, hasStatsParsed = hasStatsParsed, hasJsonStats = hasJsonStats)
 
-        // Typed statistics can only replace the json ones when the caller asked for them, this
-        // checkpoint actually provides them, and its schema can be reconciled with the schema the
-        // caller expects. Note that a checkpoint carrying both representations still reads the
-        // json one, exactly as it did before; preferring the typed column in that case is a
-        // separate, independently gated change.
-        val reconciledStatsParsedColOpt = parsedStatsSchemaOpt.flatMap { targetSchema =>
-          Option.when(hasStatsParsed && !hasJsonStats)(()).flatMap { _ =>
+        // A checkpoint that only offers typed statistics has always been read that way. One that
+        // offers both is only read that way on request, because doing so is a pessimization
+        // unless the typed statistics can travel to their consumer without being json encoded on
+        // the way.
+        val canUseStatsParsed =
+          hasStatsParsed && (!hasJsonStats || (preferParsedStats && parsedStatsSchemaOpt.isDefined))
+
+        // Typed statistics also have to be reinterpretable as the schema the caller expects,
+        // otherwise we would be handing data skipping bounds it cannot trust.
+        val reconciledStatsParsedColOpt = parsedStatsSchemaOpt.filter(_ => canUseStatsParsed)
+          .flatMap { targetSchema =>
             val statsParsedSchema = addSchema("stats_parsed").dataType.asInstanceOf[StructType]
             val reconciled = CheckpointProvider.reconcileParsedStatsSchema(
               col("add.stats_parsed"), statsParsedSchema, targetSchema)
@@ -177,10 +181,20 @@ trait FileBasedCheckpointProvider
             }
             reconciled
           }
-        }
 
+        CheckpointProvider.recordStatsSource(
+          deltaLog,
+          version,
+          hasStatsParsed = hasStatsParsed,
+          hasJsonStats = hasJsonStats,
+          usedStatsParsed = reconciledStatsParsedColOpt.isDefined)
+
+        // Read the typed column when we are either going to hand it on directly, or have to json
+        // encode it because it is the only representation this checkpoint has.
+        val readStatsParsed = canUseStatsParsed && !hasJsonStats ||
+          reconciledStatsParsedColOpt.isDefined
         val (checkpointSchemaToUse, checkpointStatsColToUse) =
-          if (hasStatsParsed && !hasJsonStats) {
+          if (readStatsParsed) {
             val statsParsedSchema = addSchema("stats_parsed").dataType.asInstanceOf[StructType]
             val checkpointSchemaToUse =
               Action.logSchemaWithAddStatsParsed(addSchema("stats_parsed"))
@@ -197,10 +211,14 @@ trait FileBasedCheckpointProvider
             // them here; the json form is materialized later, and only for the consumers that
             // still require it.
             val jsonStatsToUse =
-              if (reconciledStatsParsedColOpt.isDefined) {
-                lit(null).cast(StringType)
-              } else {
+              if (reconciledStatsParsedColOpt.isEmpty) {
                 to_json(encodedStatsCol)
+              } else if (hasJsonStats) {
+                // The checkpoint has the json statistics anyway, so keep handing them out rather
+                // than making their consumers re-encode what we just decided not to read.
+                jsonStatsCol
+              } else {
+                lit(null).cast(StringType)
               }
             (checkpointSchemaToUse, jsonStatsToUse)
           } else {
@@ -257,6 +275,12 @@ object CheckpointProvider extends DeltaLogging {
      */
     val JsonPreferredOverStatsParsed = "jsonPreferredOverStatsParsed"
 
+    /**
+     * The checkpoint provided both columns and the typed one was used for data skipping, with the
+     * json one still handed to the consumers that require it. Nothing is converted either way.
+     */
+    val StatsParsedPreferredOverJson = "statsParsedPreferredOverJson"
+
     /** The checkpoint provided neither column, so the snapshot cannot skip any files. */
     val NoStats = "noStats"
   }
@@ -266,10 +290,12 @@ object CheckpointProvider extends DeltaLogging {
       deltaLog: DeltaLog,
       checkpointVersion: Long,
       hasStatsParsed: Boolean,
-      hasJsonStats: Boolean): Unit = {
+      hasJsonStats: Boolean,
+      usedStatsParsed: Boolean = false): Unit = {
     val statsSource = (hasStatsParsed, hasJsonStats) match {
       case (true, false) => StatsSource.StatsParsed
       case (false, true) => StatsSource.Json
+      case (true, true) if usedStatsParsed => StatsSource.StatsParsedPreferredOverJson
       case (true, true) => StatsSource.JsonPreferredOverStatsParsed
       case (false, false) => StatsSource.NoStats
     }
@@ -280,7 +306,8 @@ object CheckpointProvider extends DeltaLogging {
         "checkpointVersion" -> checkpointVersion,
         "statsSource" -> statsSource,
         "hasStatsParsed" -> hasStatsParsed,
-        "hasJsonStats" -> hasJsonStats))
+        "hasJsonStats" -> hasJsonStats,
+        "usedStatsParsed" -> usedStatsParsed))
   }
 
   /**

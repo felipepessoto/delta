@@ -239,6 +239,17 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(true)
 
+  val DELTA_SNAPSHOT_PREFER_PARSED_STATS_ENABLED =
+    buildConf("snapshot.preferParsedStats.enabled")
+      .internal()
+      .doc("When enabled, a checkpoint that carries file statistics both as json and as a typed " +
+        "struct hands the typed ones to data skipping, which then parses nothing. The json " +
+        "statistics are still read and handed to the consumers that require them, so no " +
+        "representation is ever converted. Has no effect unless " +
+        "spark.databricks.delta.snapshot.parsedStatsPassthrough.enabled is also set.")
+      .booleanConf
+      .createWithDefault(false)
+
   val DELTA_SNAPSHOT_LOGGING_MAX_FILES_THRESHOLD =
     buildConf("snapshot.logging.maxFilesThreshold")
       .internal()
